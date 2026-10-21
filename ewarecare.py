@@ -2461,6 +2461,8 @@ def _run_readonly(argv: list[str],
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             creationflags=_CREATE_NO_WINDOW,
         )
@@ -2468,6 +2470,8 @@ def _run_readonly(argv: list[str],
         return False, "", f"command not found: {argv[0]}"
     except subprocess.TimeoutExpired:
         return False, "", f"{argv[0]} timed out after {timeout:g}s"
+    except UnicodeError as exc:  # defensive: bytes outside the declared codec
+        return False, "", f"{argv[0]} produced undecodable output: {exc}"
     except (PermissionError, OSError) as exc:
         return False, "", f"{argv[0]} could not run: {exc}"
     out = proc.stdout or ""
@@ -3357,6 +3361,19 @@ PROTECTED_PROCESS_NAMES = frozenset({
     "python", "pythonw", "pylauncher",
 })
 
+# Irreducible safety floor: even if PROTECTED_PROCESS_NAMES is ever emptied,
+# reset or user-cleared at runtime, these names are still refused outright.
+_HARD_PROTECTED_FLOOR = frozenset({
+    # Windows kernel / session
+    "system", "system idle process", "idle", "registry",
+    "memory compression", "smss", "csrss", "wininit", "winlogon",
+    "services", "lsass", "svchost", "dwm", "explorer",
+    # macOS / Linux
+    "kernel_task", "launchd", "init", "systemd",
+    # This application itself.
+    "python", "pythonw",
+})
+
 # Lowest PID value that may be terminated (0/4 are kernel on Windows).
 _MIN_KILLABLE_PID = 5
 
@@ -3370,7 +3387,8 @@ def is_protected_process(name: str | None) -> bool:
     base = str(name).strip().lower()
     base = base[:-4] if base.endswith(".exe") else base
     base = base.strip()
-    return (not base) or base in PROTECTED_PROCESS_NAMES
+    return ((not base) or base in _HARD_PROTECTED_FLOOR
+            or base in PROTECTED_PROCESS_NAMES)
 
 
 class ActionRule:
@@ -3385,22 +3403,31 @@ class ActionRule:
         self.metric = metric
         self.threshold = float(threshold)
         self.duration_s = float(duration_s)
+        if self.duration_s <= 0:
+            raise ValueError(
+                f"duration_s must be > 0 (no sustained-breach window = "
+                f"instant fire): got {self.duration_s!r}")
         self.action_type = action_type
         self.label = label
         # Live state: consecutive seconds spent above the threshold, and
         # how many times the rule has actually fired.
         self.breach_s = 0.0
         self.times_fired = 0
+        # Double-fire guard: set on dispatch, cleared when the action thread
+        # finishes (see RuleEngine._dispatch / _run_action).
+        self.in_flight = threading.Event()
 
     # ---------- evaluation ----------
     def value(self, snapshot) -> float | None:
         """The metric the rule watches, or None when it is unavailable."""
         if snapshot is None:
             return None
+        # A broken/partial snapshot degrades to "no value" (never raises):
+        # RuleEngine.tick promises to never raise on unusable input.
         if self.metric == "cpu":
-            value = getattr(snapshot.cpu, "percent", None)
+            value = getattr(getattr(snapshot, "cpu", None), "percent", None)
         elif self.metric == "mem":
-            value = getattr(snapshot.mem, "percent", None)
+            value = getattr(getattr(snapshot, "mem", None), "percent", None)
         else:  # disk: the most-used accessible partition
             candidates = [getattr(d, "percent", None) for d in
                           getattr(snapshot, "disks", []) or []
@@ -3497,6 +3524,15 @@ class RuleEngine:
                     # Reset first: a second fire needs another full window,
                     # even if the action thread starts slowly.
                     rule.breach_s = 0.0
+                    if rule.in_flight.is_set():
+                        # The previous action for this rule is still running
+                        # (a slow victim lookup or slow sample path): never
+                        # dispatch a second concurrent one, or the same
+                        # process can be terminated twice.
+                        self._log(f"Auto-action '{rule.action_type}' skipped "
+                                  "— previous action is still running.",
+                                  "WARNING")
+                        continue
                     rule.times_fired += 1
                     fired.append(rule)
                     self._dispatch(rule, snapshot)
@@ -3507,6 +3543,7 @@ class RuleEngine:
 
     def _dispatch(self, rule: ActionRule, snapshot) -> None:
         """Start the action on its own thread; never block the caller."""
+        rule.in_flight.set()
         try:
             if self._executor:
                 self._executor(lambda: self._run_action(rule, snapshot))
@@ -3514,6 +3551,7 @@ class RuleEngine:
                 threading.Thread(target=self._run_action, name="shds-action",
                                  args=(rule, snapshot), daemon=True).start()
         except (RuntimeError, OSError) as exc:
+            rule.in_flight.clear()
             log_actions.warning("action thread failed to start: %s", exc)
             self._log(f"Auto-action could not start its worker thread: {exc}",
                       "WARNING")
@@ -3531,6 +3569,10 @@ class RuleEngine:
         except Exception as exc:  # noqa: BLE001 - one bad action must not kill the engine
             log_actions.exception("auto-action failed: %s", exc)
             self._log(f"Auto-action '{rule.action_type}' failed: {exc}", "WARNING")
+        finally:
+            # The action is done: after a fresh full breach window the rule
+            # may fire again. Runs even when the action raised.
+            rule.in_flight.clear()
 
     # ---------- actions ----------
     def _kill_top_process(self, rule: ActionRule, snapshot) -> tuple[str, str]:
@@ -4752,7 +4794,11 @@ class MonitorWorker:
         self.interval_s = max(0.5, float(interval_s))
 
     def _loop(self) -> None:
-        while not self._stop.is_set():
+        # Bind the stop event ONCE: start() swaps self._stop between runs, so
+        # re-reading the attribute inside the loop would keep an old sampler
+        # thread alive forever when a new run arms a fresh event.
+        stop = self._stop
+        while not stop.is_set():
             started = time.monotonic()
             try:
                 snap = collect_snapshot(include_gpu=self.include_gpu)
@@ -4773,7 +4819,7 @@ class MonitorWorker:
                 log_monitoring.warning("monitor sample failed: %s", exc)
             wait = self.interval_s - (time.monotonic() - started)
             if wait > 0:
-                self._stop.wait(wait)
+                stop.wait(wait)
 
     def poll(self) -> list:
         """Drain the queue (call from the GUI thread only)."""
@@ -4976,9 +5022,19 @@ class ScannerApp(ctk.CTk):
                         foreground=T.FG_PRIMARY, rowheight=24, font=T.FONT_BODY)
         style.configure("Treeview.Heading", background=T.BG_SIDEBAR,
                         foreground=T.NEON_CYAN, font=T.FONT_SMALL)
+        style.configure("TRadiobutton", background=T.BG_MAIN,
+                        foreground=T.FG_PRIMARY)
+        style.configure("TScrollbar", background=T.BG_PANEL,
+                        troughcolor=T.BG_OUTPUT, bordercolor=T.BORDER)
         style.configure("TSpinbox", fieldbackground=T.ENTRY_BG, background=T.ENTRY_BG,
                         foreground=T.FG_PRIMARY)
         style.configure("TEntry", fieldbackground=T.ENTRY_BG, foreground=T.FG_PRIMARY)
+        style.configure("TCombobox", fieldbackground=T.ENTRY_BG,
+                        background=T.BG_CARD, foreground=T.FG_PRIMARY,
+                        arrowcolor=T.FG_PRIMARY)
+        # The combobox popdown is a classic tk.Listbox below the style system.
+        self.option_add("*TCombobox*Listbox.background", T.BG_OUTPUT)
+        self.option_add("*TCombobox*Listbox.foreground", T.FG_PRIMARY)
 
     def _build_layout(self) -> None:
         # Sidebar (240 px): brand, icon navigation, live controls.
@@ -5723,6 +5779,7 @@ class ScannerApp(ctk.CTk):
                          command=self.clean_previewed).pack(side="left")
         self.clean_list = tk.Text(clean_box, height=8, bg=T.BG_OUTPUT,
                                   fg=T.FG_PRIMARY, font=T.FONT_MONO, wrap="word",
+                                  insertbackground=T.NEON_CYAN,
                                   state="disabled")
         self.clean_list.pack(fill="both", expand=True)
         self._previewed: list[Path] = []
@@ -5747,6 +5804,7 @@ class ScannerApp(ctk.CTk):
         self.bigfiles_btn.pack(side="right")
         self.bigfiles_list = tk.Text(big_box, height=10, bg=T.BG_OUTPUT,
                                      fg=T.FG_PRIMARY, font=T.FONT_MONO,
+                                     insertbackground=T.NEON_CYAN,
                                      wrap="word", state="disabled")
         self.bigfiles_list.pack(fill="both", expand=True)
 
@@ -5804,7 +5862,7 @@ class ScannerApp(ctk.CTk):
     # Widget roles whose colours both palettes define; the swap map pairs each
     # value with its counterpart via the shared palette key.
     _THEME_SWAP_CLASSES = ("Frame", "Label", "Text", "Canvas",
-                           "LabelFrame", "Toplevel")
+                           "Labelframe", "Toplevel")
 
     def _toggle_theme(self) -> None:
         self.apply_theme("dark" if T.get_mode() == "light" else "light")
@@ -5818,6 +5876,9 @@ class ScannerApp(ctk.CTk):
         dots, output tags, chart) are re-rendered from the new palette.
         """
         mode = "light" if str(mode).lower() == "light" else "dark"
+        if T.get_mode() == mode:
+            self.set_status(f"Theme: {mode}.")   # same mode = pure no-op
+            return
         T.set_mode(mode)
         self._build_style()
         self._retheme_plain_widgets()
@@ -5892,7 +5953,8 @@ class ScannerApp(ctk.CTk):
                 continue
             if cls not in self._THEME_SWAP_CLASSES:
                 continue  # ttk widgets follow the rebuilt styles
-            for option in ("bg", "foreground", "highlightbackground"):
+            for option in ("bg", "foreground", "highlightbackground",
+                           "insertbackground"):
                 try:
                     current = str(widget.cget(option))
                     new_value = swap.get(current)
@@ -5998,7 +6060,13 @@ class ScannerApp(ctk.CTk):
 
         def _run() -> None:
             self._after_ids.discard(holder.get("id", ""))
-            fn()
+            try:
+                fn()
+            except tk.TclError:
+                # The window died between scheduling and firing (a destroy
+                # path that bypassed on_closing): never leak a callback
+                # traceback through report_callback_exception.
+                pass
 
         try:
             holder["id"] = self.after(ms, _run)
@@ -6423,7 +6491,8 @@ class ScannerApp(ctk.CTk):
             if is_windows:
                 argv = build_schtasks_argv(python_exe, script, day, when)
                 proc = subprocess.run(argv, shell=False, capture_output=True,
-                                      text=True, timeout=8)
+                                      text=True, encoding="utf-8",
+                                      errors="replace", timeout=8)
                 if proc.returncode == 0:
                     self._bg_queue.put(("schedule", (True,
                         f"Windows task registered ({day} {when}).")))
@@ -6435,6 +6504,7 @@ class ScannerApp(ctk.CTk):
                 try:
                     proc = subprocess.run(["crontab", "-l"], shell=False,
                                           capture_output=True, text=True,
+                                          encoding="utf-8", errors="replace",
                                           timeout=8)
                 except FileNotFoundError:
                     self._bg_queue.put(("schedule", (False,
@@ -6456,7 +6526,8 @@ class ScannerApp(ctk.CTk):
                                  + "\n")
                 proc = subprocess.run(["crontab", "-"], shell=False,
                                       input=crontab_text, capture_output=True,
-                                      text=True, timeout=8)
+                                      text=True, encoding="utf-8",
+                                      errors="replace", timeout=8)
                 if proc.returncode == 0:
                     self._bg_queue.put(("schedule", (True,
                         f"Cron entry registered ({day} {when}).")))
@@ -6491,7 +6562,8 @@ class ScannerApp(ctk.CTk):
             if platform.system().lower() == "windows":
                 argv = ["schtasks", "/Delete", "/TN", SCHTASKS_TASK_NAME, "/F"]
                 proc = subprocess.run(argv, shell=False, capture_output=True,
-                                      text=True, timeout=8)
+                                      text=True, encoding="utf-8",
+                                      errors="replace", timeout=8)
                 if proc.returncode == 0:
                     self._bg_queue.put(("schedule", (True,
                         "Windows scheduled task removed.")))
@@ -6502,7 +6574,8 @@ class ScannerApp(ctk.CTk):
                         " (task may not exist)")))
             else:
                 proc = subprocess.run(["crontab", "-l"], shell=False,
-                                      capture_output=True, text=True, timeout=8)
+                                      capture_output=True, text=True,
+                                      encoding="utf-8", errors="replace", timeout=8)
                 if proc.returncode != 0:
                     self._bg_queue.put(("schedule", (False,
                         "No crontab exists — nothing to remove.")))
@@ -6514,7 +6587,8 @@ class ScannerApp(ctk.CTk):
                     return
                 proc = subprocess.run(["crontab", "-"], shell=False,
                                       input=new_text, capture_output=True,
-                                      text=True, timeout=8)
+                                      text=True, encoding="utf-8",
+                                      errors="replace", timeout=8)
                 if proc.returncode == 0:
                     self._bg_queue.put(("schedule", (True,
                         f"Removed {removed} SHDS cron line(s).")))
@@ -6651,7 +6725,9 @@ class ScannerApp(ctk.CTk):
         try:
             threading.Thread(target=self._proc_job, args=(sort_by,),
                              name="shds-procs", daemon=True).start()
-        except (RuntimeError, OSError) as exc:
+        except Exception as exc:  # noqa: BLE001 - ANY start failure must
+            # clear the guard flag: refresh_processes only runs while it is
+            # False, so a wedged True flag freezes the process table forever.
             log_app.warning("process thread failed to start: %s", exc)
             self._procs_active = False
 
@@ -6794,9 +6870,26 @@ class ScannerApp(ctk.CTk):
 
     # ---------- shutdown ----------
     def on_closing(self) -> None:
+        self.monitor_running = False
+        self._monitor_polling = False
         try:
-            if self.monitor_running:
-                self.monitor.request_stop()
+            # stop() (not just request_stop) also arms a helper thread that
+            # joins the sampler and clears `monitor.running`: no monitoring
+            # loop or stale "live" state may outlive the window.
+            self.monitor.stop()
+        except Exception:
+            pass
+        try:
+            # Disarm the kill switch: no further auto-action may fire after
+            # the window is gone (an in-flight action still finishes on its
+            # thread, but nothing new is dispatched).
+            self.actions_engine.enabled = False
+        except Exception:
+            pass
+        try:
+            # Cancel CustomTkinter's internal animation `after` loop: nothing
+            # else stops it on shutdown and it keeps ticking after destroy.
+            self.scan_bar.stop()
         except Exception:
             pass
         self._scan_active = False
