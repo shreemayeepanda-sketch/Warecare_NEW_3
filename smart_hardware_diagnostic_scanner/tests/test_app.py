@@ -5,6 +5,7 @@ process list and the queue-polling loops never touch real hardware.
 """
 from __future__ import annotations
 
+import customtkinter as ctk
 import queue
 import threading
 import types
@@ -18,6 +19,7 @@ except ImportError:  # headless CI
     HAS_TK = False
 
 from scanner import app as app_mod
+from scanner import icons as icons_mod
 from scanner.diagnostics import DEFAULT_THRESHOLDS
 
 
@@ -529,3 +531,244 @@ class TestSystemHealthAndFixUI(unittest.TestCase):
         self.assertEqual(self.app.health_var.get(), "96")
         self.assertIn("OS 1 fail / 0 warn",
                       self.app.health_detail.cget("text"))
+
+
+class TestVectorIcons(unittest.TestCase):
+    """The Pillow-drawn vector icon layer (scanner.icons)."""
+
+    def setUp(self):
+        icons_mod.clear_cache()
+
+    def tearDown(self):
+        icons_mod.clear_cache()
+
+    def test_every_icon_name_renders_as_a_ctk_image(self):
+        for name in icons_mod.ICON_NAMES:
+            img = icons_mod.get_icon(name, 24, "#000000")
+            self.assertIsInstance(img, ctk.CTkImage)
+            self.assertEqual(img.cget("size"), (24, 24))
+
+    def test_painters_cover_navigation_and_card_maps(self):
+        # Sidebar icon for every page, card icon for every metric card.
+        self.assertEqual(set(icons_mod.NAV_ICONS), set(app_mod.NAV_ITEMS))
+        self.assertTrue(set(icons_mod.NAV_ICONS.values())
+                        .issubset(icons_mod.ICON_NAMES))
+        self.assertEqual(set(icons_mod.CARD_ICONS),
+                         {"CPU", "RAM", "GPU", "Disk", "Network"})
+        self.assertTrue(set(icons_mod.CARD_ICONS.values())
+                        .issubset(icons_mod.ICON_NAMES))
+
+    def test_unknown_name_raises_key_error(self):
+        with self.assertRaises(KeyError) as ctx:
+            icons_mod.get_icon("no-such-icon", 24, "#000000")
+        self.assertIn("unknown icon name", str(ctx.exception))
+
+    def test_size_is_clamped_and_ints_are_used(self):
+        # Degenerate sizes clamp to the 8 px floor; floats truncate.
+        self.assertEqual(icons_mod.get_icon("cpu", 3, "#000000").cget("size"),
+                         (8, 8))
+        self.assertEqual(
+            icons_mod.get_icon("cpu", -5, "#000000").cget("size"), (8, 8))
+        self.assertEqual(icons_mod.get_icon("cpu", 22.7, "#000000").cget("size"),
+                         (22, 22))
+
+    def test_default_colour_comes_from_the_active_palette(self):
+        with patch.object(icons_mod.T, "NEON_CYAN", "#ABC123"):
+            icons_mod.get_icon("cpu", 12)
+            self.assertIn(("cpu", 12, "#ABC123"), icons_mod._BITMAP_CACHE)
+        # An explicit colour bypasses the palette entirely.
+        icons_mod.get_icon("cpu", 12, "#123456")
+        self.assertIn(("cpu", 12, "#123456"), icons_mod._BITMAP_CACHE)
+
+    def test_bitmap_is_cached_but_ctkimage_is_fresh(self):
+        first = icons_mod.get_icon("gpu", 24, "#99AABB")
+        second = icons_mod.get_icon("gpu", 24, "#99AABB")
+        self.assertIsNot(first, second)  # fresh CTkImage wrapper per call
+        self.assertIs(first.cget("light_image"), second.cget("light_image"))
+        self.assertIs(first.cget("light_image"), first.cget("dark_image"))
+
+    def test_clear_cache_drops_bitmaps(self):
+        first = icons_mod.get_icon("disk", 16, "#0F0F0F")
+        icons_mod.clear_cache()
+        self.assertEqual(icons_mod._BITMAP_CACHE, {})
+        again = icons_mod.get_icon("disk", 16, "#0F0F0F")
+        self.assertIsNot(again.cget("light_image"), first.cget("light_image"))
+
+    def test_bitmaps_are_squares_with_transparent_corners(self):
+        for name in icons_mod.ICON_NAMES:
+            bitmap = icons_mod.get_icon(name, 20, "#000000").cget("light_image")
+            with self.subTest(name=name):
+                self.assertEqual(bitmap.size, (20, 20))
+                self.assertEqual(bitmap.mode, "RGBA")
+                self.assertEqual(bitmap.getpixel((0, 0))[3], 0,
+                                 "icon left a stroke at the canvas corner")
+
+
+class TestIconSidebarAndCards(unittest.TestCase):
+    """New widget set: the 240 px icon sidebar and the rounded CTkFrame cards.
+
+    These checks only read construction-time options (no event pump), so no
+    background callback can interfere with the asserted widget state.
+    """
+
+    def setUp(self):
+        if not HAS_TK:
+            self.skipTest("Tkinter not available")
+        with patch.object(app_mod, "HAS_PSUTIL", False), \
+             patch.object(app_mod, "HAS_MPL", False), \
+             patch.object(app_mod.messagebox, "showwarning"), \
+             patch.object(app_mod.messagebox, "showinfo"), \
+             patch.object(app_mod.messagebox, "showerror"):
+            self.app = app_mod.ScannerApp()
+        self.addCleanup(self.app.destroy)
+
+    def test_sidebar_is_240_px_wide(self):
+        self.app.update_idletasks()
+        self.app.update()
+        self.assertEqual(self.app.sidebar.winfo_width(), 240)
+
+    def test_nav_buttons_are_left_aligned_icon_pills(self):
+        self.assertEqual(set(self.app.nav_buttons), set(app_mod.NAV_ITEMS))
+        for item in app_mod.NAV_ITEMS:
+            btn = self.app.nav_buttons[item]
+            self.assertIsInstance(btn, ctk.CTkButton)
+            self.assertEqual(btn.cget("anchor"), "w")
+            self.assertEqual(int(btn.cget("corner_radius")), 8)
+            image = btn.cget("image")
+            self.assertIsInstance(image, ctk.CTkImage)
+            self.assertEqual(image.cget("size"),
+                             (app_mod.ICON_SIZE, app_mod.ICON_SIZE))
+
+    def test_show_page_highlights_only_the_active_nav_item(self):
+        active = self.app.nav_buttons["Dashboard"]  # Dashboard starts active
+        self.assertEqual(active.cget("fg_color"), app_mod.T.BTN_SIDE_ACTIVE_BG)
+        self.assertEqual(active.cget("text_color"), app_mod.T.BTN_SIDE_ACTIVE_FG)
+        inactive = self.app.nav_buttons["Processes"]
+        self.assertEqual(inactive.cget("fg_color"), app_mod.T.BTN_SIDE_BG)
+        self.assertEqual(inactive.cget("text_color"), app_mod.T.BTN_SIDE_FG)
+        self.app.show_page("Processes")
+        self.assertEqual(self.app.nav_buttons["Dashboard"].cget("fg_color"),
+                         app_mod.T.BTN_SIDE_BG)
+        active = self.app.nav_buttons["Processes"]
+        self.assertEqual(active.cget("fg_color"), app_mod.T.BTN_SIDE_ACTIVE_BG)
+        self.assertEqual(active.cget("text_color"), app_mod.T.BTN_SIDE_ACTIVE_FG)
+
+    def test_active_nav_icon_is_colour_mapped_accent(self):
+        # Icons are bitmaps: the active/inactive versions must be the cached
+        # cyan/muted renderings, not just "an icon".
+        self.app.show_page("Processes")
+        image = self.app.nav_buttons["Processes"].cget("image")
+        accent = icons_mod._BITMAP_CACHE[
+            (icons_mod.NAV_ICONS["Processes"], app_mod.ICON_SIZE,
+             app_mod.T.NEON_CYAN)]
+        self.assertIs(image.cget("light_image"), accent)
+        muted = icons_mod._BITMAP_CACHE[
+            (icons_mod.NAV_ICONS["Dashboard"], app_mod.ICON_SIZE,
+             app_mod.T.FG_MUTED)]
+        dashboard = self.app.nav_buttons["Dashboard"].cget("image")
+        self.assertIs(dashboard.cget("light_image"), muted)
+
+    def test_dark_nav_highlight_matches_the_spec_colours(self):
+        self.app.apply_theme("dark")
+        self.app.show_page("Diagnostics")
+        btn = self.app.nav_buttons["Diagnostics"]
+        self.assertEqual(btn.cget("fg_color"), "#1E1E2E")
+        self.assertEqual(btn.cget("text_color"), "#00E5FF")
+        other = self.app.nav_buttons["Startup"]
+        self.assertEqual(other.cget("fg_color"), "transparent")
+
+    def test_five_metric_cards_are_rounded_ctk_frames(self):
+        self.assertEqual(len(self.app._card_slots), 5)
+        for card, _col in self.app._card_slots:
+            self.assertIsInstance(card, ctk.CTkFrame)
+            self.assertEqual(card.cget("corner_radius"), 12)
+            self.assertEqual(int(card.cget("border_width")), 1)
+            self.assertEqual(card.cget("border_color"), app_mod.T.BORDER)
+            self.assertEqual(card.cget("fg_color"), app_mod.T.BG_CARD)
+
+    def test_cards_registry_still_holds_the_4_tuple_contract(self):
+        for title in ("CPU", "RAM", "GPU", "Disk", "Network"):
+            with self.subTest(title=title):
+                val, bar, detail, dot = self.app.cards[title]
+                self.assertEqual(val.cget("text"), "—")
+                self.assertIsInstance(bar, ctk.CTkProgressBar)
+
+    def test_every_card_carries_its_mapped_vector_icon(self):
+        self.assertEqual(set(self.app._card_icons), set(icons_mod.CARD_ICONS))
+        for title, (icon_label, icon_name, accent_key) in \
+                self.app._card_icons.items():
+            with self.subTest(title=title):
+                self.assertEqual(icon_name, icons_mod.CARD_ICONS[title])
+                self.assertIsInstance(icon_label, ctk.CTkLabel)
+                self.assertEqual(icon_label.cget("text"), "")
+                self.assertEqual(icon_label.cget("bg_color"),
+                                 app_mod.T.BG_CARD)
+                image = icon_label.cget("image")
+                self.assertIsInstance(image, ctk.CTkImage)
+                self.assertEqual(image.cget("size"), (22, 22))
+                self.assertTrue(accent_key, "accent key must be recorded")
+
+    def test_hero_health_card_holds_shield_icon_and_score(self):
+        self.assertIsInstance(self.app.health_icon, ctk.CTkLabel)
+        image = self.app.health_icon.cget("image")
+        self.assertIsInstance(image, ctk.CTkImage)
+        self.assertEqual(image.cget("size"), (28, 28))
+        self.assertIsInstance(self.app.health_bar, ctk.CTkProgressBar)
+        self.assertEqual(self.app.health_bar.get(), 0)
+        self.assertEqual(self.app.health_var.get(), "—")
+
+
+class TestThemeIconRefresh(unittest.TestCase):
+    """A live theme toggle must redraw the colour-bearing vector icons and
+    re-resolve every rounded card's stored background literal."""
+
+    def setUp(self):
+        if not HAS_TK:
+            self.skipTest("Tkinter not available")
+        with patch.object(app_mod, "HAS_PSUTIL", False), \
+             patch.object(app_mod, "HAS_MPL", False), \
+             patch.object(app_mod.messagebox, "showwarning"), \
+             patch.object(app_mod.messagebox, "showinfo"), \
+             patch.object(app_mod.messagebox, "showerror"):
+            self.app = app_mod.ScannerApp()
+        self.addCleanup(self.app.destroy)
+        # Leave the global palette in the dark default for later tests.
+        self.addCleanup(self.app.apply_theme, "dark")
+
+    def test_light_toggle_redraws_icons_with_light_palette_colours(self):
+        _, light = app_mod.T.palettes()
+        expected = {("security", 28, light["NEON_CYAN"])}
+        for _title, icon_name, accent_key in self.app._card_titles:
+            expected.add((icon_name, 22, light[accent_key]))
+        with patch.object(app_mod.icons, "get_icon",
+                          wraps=app_mod.icons.get_icon) as spy:
+            self.app.apply_theme("light")
+        seen = {(call.args[0], call.args[1], call.args[2])
+                for call in spy.call_args_list}
+        self.assertTrue(expected <= seen,
+                        "light mode missed the icon redraws for the palette: "
+                        f"missing {sorted(expected - seen)}")
+        self.assertEqual(self.app._card_icons["CPU"][0].cget("bg_color"),
+                         app_mod.T.BG_CARD)
+        self.assertEqual(self.app.theme_btn.cget("text"), "◐  Switch to dark")
+
+    def test_light_toggle_re_resolves_stored_card_backgrounds(self):
+        self.app.apply_theme("light")
+        for card, _col in self.app._card_slots:
+            with self.subTest():
+                self.assertIsInstance(card, ctk.CTkFrame)
+                self.assertEqual(card.cget("fg_color"), app_mod.T.BG_CARD)
+                self.assertEqual(card.cget("border_color"), app_mod.T.BORDER)
+                self.assertEqual(card.cget("corner_radius"), 12)
+        # The light palette actually replaced the dark card background.
+        self.assertNotEqual(app_mod.T.BG_CARD, "#1C1C28")
+        # And the icon labels still hold fresh CTkImages at their sizes.
+        self.assertEqual(
+            self.app._card_icons["RAM"][0].cget("image").cget("size"), (22, 22))
+
+    def test_dark_round_trip_restores_the_spec_colours(self):
+        self.app.apply_theme("light")
+        self.app.apply_theme("dark")
+        for card, _col in self.app._card_slots:
+            self.assertEqual(card.cget("fg_color"), "#1C1C28")
+        self.assertEqual(self.app.theme_btn.cget("text"), "◐  Switch to light")

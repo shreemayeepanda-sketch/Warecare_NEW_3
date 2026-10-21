@@ -18,6 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 from . import theme as T
+from . import icons
 from .charts import HAS_MPL, ChartPanel
 from . import ctk_widgets as ctkw
 from .actions import ACTION_LABELS, METRIC_LABELS, ActionRule, RuleEngine
@@ -43,6 +44,9 @@ log = configure_logging()
 
 NAV_ITEMS = ["Dashboard", "Processes", "Connections", "Startup", "Automation",
              "Diagnostics", "Reports & Tools"]
+
+#: Display size (px) of the sidebar's vector icons.
+ICON_SIZE = 20
 
 SAFE_TEMP_SUFFIXES = {".tmp", ".log", ".bak", ".cache", ".dmp", ".old"}
 
@@ -172,44 +176,49 @@ class ScannerApp(ctk.CTk):
         style.configure("TEntry", fieldbackground=T.ENTRY_BG, foreground=T.FG_PRIMARY)
 
     def _build_layout(self) -> None:
-        # Sidebar
-        self.sidebar = ttk.Frame(self, style="Side.TFrame", width=210)
+        # Sidebar (240 px): brand, icon navigation, live controls.
+        self.sidebar = tk.Frame(self, bg=T.BG_SIDEBAR, width=240)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
         brand = tk.Label(self.sidebar, text="◈  SHDS", bg=T.BG_SIDEBAR,
-                         fg=T.NEON_CYAN, font=(T.FONT_FAMILY, 15, "bold"))
-        brand.pack(pady=(18, 2), padx=12, anchor="w")
-        sub = tk.Label(self.sidebar, text="Dark Neon Edition\nby Devansh",
-                       bg=T.BG_SIDEBAR, fg=T.FG_MUTED, font=T.FONT_SMALL, justify="left")
-        sub.pack(padx=12, anchor="w", pady=(0, 16))
+                         fg=T.NEON_CYAN, font=(T.FONT_FAMILY, 17, "bold"))
+        brand.pack(pady=(18, 2), padx=16, anchor="w")
+        sub = tk.Label(self.sidebar, text="Hardware Diagnostic Scanner\nby Devansh",
+                       bg=T.BG_SIDEBAR, fg=T.FG_MUTED, font=T.FONT_SMALL,
+                       justify="left")
+        sub.pack(padx=16, anchor="w", pady=(0, 14))
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
         for item in NAV_ITEMS:
             btn = T.make_side_button(self.sidebar, T.BG_SIDEBAR,
-                                     text=f"  {item}",
+                                     text=f" {item}",
+                                     image=self._nav_icon(item, active=False),
                                      command=lambda n=item: self.show_page(n))
-            btn.pack(fill="x", padx=8, pady=2)
+            btn.pack(fill="x", padx=10, pady=3)
             self.nav_buttons[item] = btn
+        tk.Frame(self.sidebar, bg=T.BORDER, height=1).pack(
+            fill="x", padx=16, pady=(14, 0))
         tk.Label(self.sidebar, text="Refresh interval (s):", bg=T.BG_SIDEBAR,
-                 fg=T.FG_MUTED, font=T.FONT_SMALL).pack(padx=12, pady=(18, 2), anchor="w")
+                 fg=T.FG_MUTED, font=T.FONT_SMALL).pack(padx=16, pady=(12, 2),
+                                                        anchor="w")
         intervals = ttk.Combobox(self.sidebar, textvariable=self.refresh_interval,
                                  values=["0.5", "1.0", "2.0", "5.0"], width=8,
                                  state="readonly")
-        intervals.pack(padx=12, anchor="w")
+        intervals.pack(padx=16, anchor="w")
         intervals.bind("<<ComboboxSelected>>", lambda _e: self._apply_interval())
         self.mon_btn = T.make_button(self.sidebar, "accent", T.BG_SIDEBAR,
                                      text="▶  Start monitoring",
                                      command=self.toggle_monitoring)
-        self.mon_btn.pack(fill="x", padx=12, pady=(16, 6))
+        self.mon_btn.pack(fill="x", padx=16, pady=(16, 6))
         self.theme_btn = T.make_button(
             self.sidebar, "ghost", T.BG_SIDEBAR,
             text="◐  Switch to light" if T.get_mode() == "dark" else "◐  Switch to dark",
             command=self._toggle_theme)
-        self.theme_btn.pack(fill="x", padx=12)
+        self.theme_btn.pack(fill="x", padx=16)
         self._update_btn = T.make_button(
             self.sidebar, "ghost", T.BG_SIDEBAR,
             text="⇩  Check for updates",
             command=self.check_for_updates)
-        self._update_btn.pack(fill="x", padx=12, pady=(6, 0))
+        self._update_btn.pack(fill="x", padx=16, pady=(6, 0))
 
         # Main column
         main_col = ttk.Frame(self)
@@ -249,20 +258,37 @@ class ScannerApp(ctk.CTk):
                  fg=T.NEON_PURPLE, font=T.FONT_SMALL).pack(side="right", padx=12)
 
     # ---------- pages ----------
-    def _card(self, parent, title: str, accent: str):
-        card = ttk.Frame(parent, style="Card.TFrame", width=T.CARD_MIN_WIDTH,
-                         height=T.CARD_HEIGHT)
-        card.pack_propagate(False)
-        card.rowconfigure(2, weight=1)
+    def _nav_icon(self, item: str, active: bool):
+        """Vector icon for one sidebar entry (cyan when active, muted else)."""
+        return icons.get_icon(icons.NAV_ICONS[item], ICON_SIZE,
+                              T.NEON_CYAN if active else T.FG_MUTED)
+
+    def _card(self, parent, title: str, icon_name: str, accent_key: str):
+        """Build one rounded dashboard card.
+
+        Layout: vector icon top-left with the title beside it, the live
+        value in large bold text below, a progress bar and a detail line.
+        Returns (card, value_label, bar, detail_label, status_dot, icon_label);
+        `self.cards[title]` keeps the (value, bar, detail, dot) tuple the
+        snapshot renderer updates.
+        """
+        accent = getattr(T, accent_key)
+        card = T.make_card(parent, T.BG_MAIN)
+        card.configure(width=T.CARD_MIN_WIDTH, height=T.CARD_HEIGHT)
+        card.grid_propagate(False)
         card.columnconfigure(0, weight=1)
+        card.rowconfigure(3, weight=1)
         top = tk.Frame(card, bg=T.BG_CARD)
         top.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 0))
+        icon = ctk.CTkLabel(top, image=icons.get_icon(icon_name, 22, accent),
+                            text="", bg_color=T.BG_CARD, width=26)
+        icon.pack(side="left")
         tk.Label(top, text=title, bg=T.BG_CARD, fg=accent,
-                 font=T.FONT_HEADING).pack(side="left")
+                 font=T.FONT_HEADING).pack(side="left", padx=(8, 0))
         dot = tk.Label(top, text="●", bg=T.BG_CARD, fg=T.FG_DIM, font=T.FONT_BODY)
         dot.pack(side="right")
         val = tk.Label(card, text="—", bg=T.BG_CARD, fg=T.FG_PRIMARY,
-                       font=(T.FONT_FAMILY, 15, "bold"), anchor="w")
+                       font=(T.FONT_FAMILY, 16, "bold"), anchor="w")
         val.grid(row=1, column=0, sticky="ew", padx=12, pady=(4, 0))
         bar = ctkw.make_progress(card, T.BG_CARD, mode="determinate", maximum=100)
         bar.grid(row=2, column=0, sticky="ew", padx=12, pady=(6, 0))
@@ -270,17 +296,24 @@ class ScannerApp(ctk.CTk):
                           font=T.FONT_SMALL, wraplength=T.CARD_MIN_WIDTH - 36,
                           justify="left", anchor="nw")
         detail.grid(row=3, column=0, sticky="ew", padx=12, pady=(4, 8))
-        return card, val, bar, detail, dot
+        return card, val, bar, detail, dot, icon
 
     def _build_dashboard(self, page) -> None:
         # "System Health": one combined 0-100 score across CPU, RAM, disk and
-        # the OS-level checks. It sits above the five metric cards so their
-        # tested single-row layout stays unchanged.
-        health = tk.Frame(page, bg=T.BG_CARD, highlightbackground=T.BORDER,
-                          highlightthickness=1)
+        # the OS-level checks, presented as a wide hero card above the five
+        # metric cards (whose single-row grid layout is covered by tests).
+        health = T.make_card(page, T.BG_MAIN, height=92)
         health.pack(fill="x", pady=(0, 8))
+        health.grid_propagate(False)
+        health.columnconfigure(2, weight=1)
+        health.rowconfigure(0, weight=1)
+        self.health_icon = ctk.CTkLabel(
+            health, image=icons.get_icon("security", 28, T.NEON_CYAN),
+            text="", bg_color=T.BG_CARD, width=34)
+        self.health_icon.grid(row=0, column=0, rowspan=2, padx=(14, 6),
+                              pady=10, sticky="ns")
         left = tk.Frame(health, bg=T.BG_CARD)
-        left.pack(side="left", padx=12, pady=6)
+        left.grid(row=0, column=1, sticky="nsw", padx=(0, 10), pady=8)
         tk.Label(left, text="SYSTEM HEALTH", bg=T.BG_CARD, fg=T.FG_MUTED,
                  font=T.FONT_SMALL).pack(anchor="w")
         score_row = tk.Frame(left, bg=T.BG_CARD)
@@ -288,20 +321,22 @@ class ScannerApp(ctk.CTk):
         self.health_var = tk.StringVar(value="—")
         self.health_label = tk.Label(score_row, textvariable=self.health_var,
                                      bg=T.BG_CARD, fg=T.FG_DIM,
-                                     font=(T.FONT_FAMILY, 22, "bold"))
+                                     font=(T.FONT_FAMILY, 24, "bold"))
         self.health_label.pack(side="left")
         tk.Label(score_row, text="/ 100", bg=T.BG_CARD, fg=T.FG_MUTED,
                  font=T.FONT_SMALL).pack(side="left", anchor="s",
                                          padx=(4, 0), pady=(0, 3))
-        self.health_bar = ctkw.make_progress(health, T.BG_CARD, height=10,
-                                             width=240)
-        self.health_bar.pack(side="left", fill="x", expand=True, padx=(4, 16))
+        right = tk.Frame(health, bg=T.BG_CARD)
+        right.grid(row=0, column=2, sticky="ew", padx=(0, 14), pady=8)
+        right.columnconfigure(0, weight=1)
+        self.health_bar = ctkw.make_progress(right, T.BG_CARD, height=10)
+        self.health_bar.grid(row=0, column=0, sticky="ew", pady=(6, 2))
         self.health_bar.set(0)
         self.health_detail = tk.Label(
-            health, text="Waiting for the first metrics sample…", bg=T.BG_CARD,
+            right, text="Waiting for the first metrics sample…", bg=T.BG_CARD,
             fg=T.FG_MUTED, font=T.FONT_SMALL, justify="left", anchor="w",
-            wraplength=320)
-        self.health_detail.pack(side="left", padx=(0, 12))
+            wraplength=420)
+        self.health_detail.grid(row=1, column=0, sticky="ew")
 
         # Cards sit in a single-row grid whose column widths are recomputed
         # from the row's actual pixel width on every resize, so all five
@@ -310,17 +345,23 @@ class ScannerApp(ctk.CTk):
         # that overflowed the window.
         self.cards_row = ttk.Frame(page)
         self.cards_row.pack(fill="x", pady=(0, 8))
-        self._card_titles = [("CPU", T.NEON_CYAN), ("RAM", T.NEON_PURPLE),
-                             ("GPU", T.NEON_GREEN), ("Disk", T.NEON_YELLOW),
-                             ("Network", T.NEON_ORANGE)]
+        # (title, icon name, palette accent key) per card.
+        self._card_titles = [("CPU", "cpu", "NEON_CYAN"),
+                             ("RAM", "ram", "NEON_PURPLE"),
+                             ("GPU", "gpu", "NEON_GREEN"),
+                             ("Disk", "disk", "AMBER"),
+                             ("Network", "network", "NEON_YELLOW")]
         self.cards: dict[str, tuple] = {}
-        self._card_slots: list[tuple[ttk.Frame, int]] = []
-        for col, (title, accent) in enumerate(self._card_titles):
-            card, val, bar, detail, dot = self._card(self.cards_row, title, accent)
+        self._card_icons: dict[str, tuple] = {}
+        self._card_slots: list[tuple[object, int]] = []
+        for col, (title, icon_name, accent_key) in enumerate(self._card_titles):
+            card, val, bar, detail, dot, icon = self._card(
+                self.cards_row, title, icon_name, accent_key)
             card.grid(row=0, column=col, sticky="nsew", padx=(0, 8))
             self.cards_row.columnconfigure(col, weight=1, minsize=0)
             self.cards[title] = (val, bar, detail, dot)
             self._card_slots.append((card, col))
+            self._card_icons[title] = (icon, icon_name, accent_key)
         # Rows must not grow vertically: cards keep CARD_HEIGHT, the chart
         # below absorbs the rest.
         self.cards_row.rowconfigure(0, weight=0)
@@ -939,14 +980,16 @@ class ScannerApp(ctk.CTk):
         self.current_page = name
         self.page_title.configure(text=name)
         # CustomTkinter buttons have no ttk "pressed" state: the active nav
-        # item is highlighted by its colours instead.
+        # item is highlighted by its colours and icon instead (solid
+        # background + neon-cyan icon and label).
         for key, btn in self.nav_buttons.items():
-            if key == name:
-                btn.configure(fg_color=T.BTN_SIDE_ACTIVE_BG,
-                              text_color=T.BTN_SIDE_ACTIVE_FG)
-            else:
-                btn.configure(fg_color=T.BTN_SIDE_BG,
-                              text_color=T.BTN_SIDE_FG)
+            active = key == name
+            btn.configure(
+                fg_color=T.BTN_SIDE_ACTIVE_BG if active else T.BTN_SIDE_BG,
+                text_color=T.BTN_SIDE_ACTIVE_FG if active else T.BTN_SIDE_FG,
+                hover_color=T.BTN_SIDE_ACTIVE_BG if active else T.BTN_SIDE_HOVER,
+                bg_color=T.BG_SIDEBAR,
+                image=self._nav_icon(key, active))
         self.set_status(f"Viewing {name}.")
 
     def set_status(self, msg: str) -> None:
@@ -982,6 +1025,9 @@ class ScannerApp(ctk.CTk):
         if self.chart is not None:
             self.chart.set_palette(T.BG_CARD, T.FG_PRIMARY, T.BORDER,
                                    T.NEON_CYAN, T.NEON_PURPLE)
+        # Vector icons carry colours baked into their bitmaps: redraw them
+        # from the freshly swapped palette.
+        self._refresh_card_icons()
         self.theme_btn.configure(
             text="◐  Switch to dark" if mode == "light" else "◐  Switch to light")
         self.set_status(f"Theme: {mode}.")
@@ -992,13 +1038,35 @@ class ScannerApp(ctk.CTk):
                 log.debug("snapshot re-render after theme change failed",
                           exc_info=True)
 
+    def _refresh_card_icons(self) -> None:
+        """Re-render the dashboard's vector icons after a palette swap.
+
+        Icons are colour-bearing bitmaps, so a live theme toggle must draw
+        them again from the newly active palette (the nav buttons get the
+        same treatment inside `show_page`).
+        """
+        try:
+            for icon_label, icon_name, accent_key in self._card_icons.values():
+                icon_label.configure(
+                    image=icons.get_icon(icon_name, 22, getattr(T, accent_key)),
+                    bg_color=T.BG_CARD)
+            health_icon = getattr(self, "health_icon", None)
+            if health_icon is not None:
+                health_icon.configure(
+                    image=icons.get_icon("security", 28, T.NEON_CYAN),
+                    bg_color=T.BG_CARD)
+        except (tk.TclError, KeyError, AttributeError) as exc:
+            log.debug("card icon re-render skipped: %s", exc)
+
     def _retheme_plain_widgets(self) -> None:
         """Re-colour every plain (non-ttk) widget via the palette swap map."""
         dark, light = T.palettes()
         swap: dict[str, str] = {}
         for key in T.PALETTE_KEYS:
-            swap[dark[key]] = light[key]
-            swap[light[key]] = dark[key]
+            # First-wins: two palette keys may share a colour, but must agree
+            # on their counterpart (see the note in theme.retheme_widget).
+            swap.setdefault(dark[key], light[key])
+            swap.setdefault(light[key], dark[key])
 
         def _descendants(widget) -> "tuple[tk.Misc, ...]":
             for child in widget.winfo_children():
@@ -1008,7 +1076,10 @@ class ScannerApp(ctk.CTk):
         for widget in _descendants(self):
             # CustomTkinter widgets know their role from construction
             # (theme.make_* factories) and re-colour straight from the palette.
-            if T.retheme_widget(widget):
+            # Un-tagged CTk children (internal widgets, plain CTkLabel images)
+            # are skipped as well: their colours are owned by the parent CTk
+            # widget's redraw, and re-colouring them here would corrupt it.
+            if T.retheme_widget(widget) or isinstance(widget, ctk.CTkBaseClass):
                 continue
             try:
                 cls = widget.winfo_class()

@@ -23,7 +23,7 @@ import customtkinter as ctk
 from . import theme as T
 
 __all__ = ["ProgressBar", "make_button", "make_side_button", "make_entry",
-           "make_switch", "make_menu", "make_progress",
+           "make_switch", "make_menu", "make_progress", "make_card",
            "apply_button_state", "apply_entry_state"]
 
 # The factories live in theme.py (they read the palette); re-exported here so
@@ -33,6 +33,7 @@ make_side_button = T.make_side_button
 make_entry = T.make_entry
 make_switch = T.make_switch
 make_menu = T.make_menu
+make_card = T.make_card
 
 
 class ProgressBar(ctk.CTkProgressBar):

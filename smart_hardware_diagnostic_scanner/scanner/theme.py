@@ -44,7 +44,7 @@ PALETTE_KEYS = (
     "BG_MAIN", "BG_PANEL", "BG_CARD", "BG_SIDEBAR", "BG_OUTPUT",
     "BG_STATUSBAR", "FG_PRIMARY", "FG_MUTED", "FG_DIM",
     "NEON_CYAN", "NEON_PURPLE", "NEON_GREEN", "NEON_YELLOW", "NEON_RED",
-    "NEON_ORANGE", "BORDER", "ENTRY_BG", "PROGRESS_BG", "OUTPUT_FG",
+    "NEON_ORANGE", "AMBER", "BORDER", "ENTRY_BG", "PROGRESS_BG", "OUTPUT_FG",
     # CustomTkinter widget colours.
     "BTN_GHOST_BG", "BTN_GHOST_HOVER", "BTN_GHOST_FG", "BTN_GHOST_BORDER",
     "BTN_ACCENT_BG", "BTN_ACCENT_HOVER", "BTN_ACCENT_FG",
@@ -53,11 +53,21 @@ PALETTE_KEYS = (
     "ENTRY_FG", "ENTRY_BORDER", "PROGRESS_FG",
 )
 
+# Sidebar buttons sit on the sidebar with `fg_color="transparent"`; only the
+# active item gets a solid highlight. "transparent" is a valid CustomTkinter
+# colour (the widget then paints its parent's colour) but not a Tk colour, so
+# it lives only in the BTN_* widget keys.
+_SIDE_TRANSPARENT = "transparent"
+
 _DARK_PALETTE = {
-    # Backgrounds.
+    # Backgrounds. BG_CARD (#1C1C28) is shared by the widgets' ghost styling —
+    # keep every value below UNIQUE across the palette, or the dark<->light
+    # retheme swap (which is keyed by colour values) resolves collisions
+    # against the wrong key. (BG_PANEL == BG_CARD and BG_SIDEBAR ==
+    # BG_STATUSBAR are safe: their light counterparts are equal too.)
     "BG_MAIN": "#12121A",
     "BG_PANEL": "#1C1C28",
-    "BG_CARD": "#232333",
+    "BG_CARD": "#1C1C28",
     "BG_SIDEBAR": "#16161F",
     "BG_OUTPUT": "#0E0E14",
     "BG_STATUSBAR": "#16161F",
@@ -72,6 +82,7 @@ _DARK_PALETTE = {
     "NEON_YELLOW": "#FFD60A",
     "NEON_RED": "#FF4D6D",
     "NEON_ORANGE": "#FF9F1C",
+    "AMBER": "#FFB545",
     # Widget specifics.
     "BORDER": "#34344A",
     "ENTRY_BG": "#101018",
@@ -85,10 +96,10 @@ _DARK_PALETTE = {
     "BTN_ACCENT_BG": "#00E5FF",
     "BTN_ACCENT_HOVER": "#4DF0FF",
     "BTN_ACCENT_FG": "#0A0A12",
-    "BTN_SIDE_BG": "#16161F",
+    "BTN_SIDE_BG": "transparent",
     "BTN_SIDE_HOVER": "#232333",
     "BTN_SIDE_FG": "#E8E8F0",
-    "BTN_SIDE_ACTIVE_BG": "#232333",
+    "BTN_SIDE_ACTIVE_BG": "#1E1E2E",
     "BTN_SIDE_ACTIVE_FG": "#00E5FF",
     # CustomTkinter entries / progress bars.
     "ENTRY_FG": "#E8E8F0",
@@ -115,6 +126,7 @@ _LIGHT_PALETTE = {
     "NEON_YELLOW": "#B58900",
     "NEON_RED": "#C81E4A",
     "NEON_ORANGE": "#D97A0F",
+    "AMBER": "#B87A1E",
     # Widget specifics.
     "BORDER": "#C8C8D8",
     "ENTRY_BG": "#FFFFFF",
@@ -128,7 +140,7 @@ _LIGHT_PALETTE = {
     "BTN_ACCENT_BG": "#0077B8",
     "BTN_ACCENT_HOVER": "#1A8FD1",
     "BTN_ACCENT_FG": "#FFFFFF",
-    "BTN_SIDE_BG": "#E9E9F1",
+    "BTN_SIDE_BG": "transparent",
     "BTN_SIDE_HOVER": "#DCDCE8",
     "BTN_SIDE_FG": "#1A1A28",
     "BTN_SIDE_ACTIVE_BG": "#DCDCE8",
@@ -234,10 +246,44 @@ def ctk_button_kwargs(role: str = "ghost", bg_color: str | None = None) -> dict:
 
 
 def ctk_side_button_kwargs(bg_color: str | None = None) -> dict:
-    """CTkButton options for a sidebar navigation button (left aligned)."""
+    """CTkButton options for a sidebar navigation button (left aligned).
+
+    Nav buttons are pill-shaped, transparent while inactive and left
+    aligned; `show_page()` highlights the active item with a solid
+    background and a neon-cyan icon + label.
+    """
     options = ctk_button_kwargs("side", bg_color)
     options["anchor"] = "w"
+    options["corner_radius"] = 8
     return options
+
+
+def ctk_card_kwargs(bg_color: str | None = None) -> dict:
+    """Constructor options for a rounded dashboard card (CTkFrame).
+
+    Cards are the visual unit of the new dashboard: slightly lighter than
+    the main background, a 12 px corner radius and a hairline border from
+    the theme.
+    """
+    options = {
+        "fg_color": BG_CARD,
+        "border_color": BORDER,
+        "border_width": 1,
+        "corner_radius": 12,
+    }
+    if bg_color:
+        options["bg_color"] = bg_color
+    return options
+
+
+def make_card(master, bg_color: str | None = None, **kwargs):
+    """Create a themed rounded card (CTkFrame) that can be re-coloured on a
+    theme switch."""
+    options = ctk_card_kwargs(bg_color)
+    options.update(kwargs)
+    card = ctk.CTkFrame(master, **options)
+    setattr(card, _THEME_TAG, ("card", None, bg_color))
+    return card
 
 
 def ctk_entry_kwargs(bg_color: str | None = None) -> dict:
@@ -376,6 +422,8 @@ def retheme_widget(widget) -> bool:
         options = ctk_button_kwargs(role, bg_color)
     elif kind == "side_button":
         options = ctk_side_button_kwargs(bg_color)
+    elif kind == "card":
+        options = ctk_card_kwargs(bg_color)
     elif kind == "entry":
         options = ctk_entry_kwargs(bg_color)
     elif kind == "switch":
@@ -386,6 +434,25 @@ def retheme_widget(widget) -> bool:
         options = ctk_progress_kwargs(bg_color)
     else:  # pragma: no cover - defensive
         return False
+    # The stored `bg_color` is the literal colour recorded at construction
+    # (the mode active back then). CustomTkinter widgets keep no live
+    # reference to the palette, so that literal would pin the *old* mode's
+    # patch colour behind every rounded corner after a toggle. Resolve it
+    # through the dark<->light mapping so it always tracks the current mode.
+    # The map is FIRST-WINS (setdefault): two palette keys sharing a colour
+    # must agree on the mapping — e.g. light dark-mode card/ghost backgrounds
+    # are both #1C1C28 -> #FFFFFF. Keep palette values unambiguous, or this
+    # resolution picks whichever key comes first.
+    if bg_color:
+        dark, light = palettes()
+        swap: dict[str, str] = {}
+        for key in PALETTE_KEYS:
+            swap.setdefault(dark[key], light[key])
+            swap.setdefault(light[key], dark[key])
+        current_bg = swap.get(bg_color, bg_color)
+        options["bg_color"] = current_bg
+    else:
+        current_bg = bg_color
     # Only re-apply the colour options; geometry stays as constructed.
     colour_keys = ("fg_color", "hover_color", "text_color",
                    "text_color_disabled", "border_color", "border_width",
@@ -397,6 +464,8 @@ def retheme_widget(widget) -> bool:
         widget.configure(**changes)
     except Exception:  # noqa: BLE001 - a re-theme must never break a toggle
         return False
+    # Remember the resolved colours, so the next toggle maps them again.
+    setattr(widget, _THEME_TAG, (kind, role, current_bg))
     return True
 
 
