@@ -1,0 +1,8 @@
+# Core runtime dependency
+-r requirements.txt
+
+# Tests
+pytest>=7.0
+
+# Optional: Windows executable packaging
+pyinstaller>=6.0; sys_platform == "win32"

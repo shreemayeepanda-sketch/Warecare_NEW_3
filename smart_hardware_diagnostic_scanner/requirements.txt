@@ -1,0 +1,3 @@
+﻿# Core runtime dependencies
+psutil>=5.9
+customtkinter>=5.2

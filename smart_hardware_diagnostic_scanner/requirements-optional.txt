@@ -1,0 +1,8 @@
+# Optional: live performance charts (app runs without it)
+# Note: matplotlib wheels for brand-new Python releases can lag; if pip
+# cannot find a build for your interpreter, the app runs fine without it.
+matplotlib>=3.7
+
+# Optional: native desktop toasts for threshold alerts. Without it the app
+# still shows an in-app alert banner, so alerts are never lost.
+plyer>=2.1

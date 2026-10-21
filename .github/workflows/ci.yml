@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: smart_hardware_diagnostic_scanner
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      # psutil is declared optional in the project; CI installs it so the
+      # positive-path tests exercise the full collectors on every OS.
+      - name: Install optional runtime deps
+        run: python -m pip install psutil matplotlib plyer
+      # The GUI tests create a real Tk root, which needs a display on Linux.
+      - name: Install a virtual display (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+      - name: Run test suite
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a python -m unittest discover -s tests -v
+          else
+            python -m unittest discover -s tests -v
+          fi
+
+  exe:
+    name: PyInstaller build (Windows)
+    needs: tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: smart_hardware_diagnostic_scanner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install psutil plyer pyinstaller
+      - name: Build SHDS.exe from spec
+        run: python -m PyInstaller --noconfirm --clean shds.spec
+      - name: Smoke-test the executable CLI
+        run: dist\SHDS.exe --help | Out-Null
+        continue-on-error: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHDS-windows-exe
+          path: smart_hardware_diagnostic_scanner/dist/SHDS.exe
+          if-no-files-found: error
