@@ -436,3 +436,96 @@ class TestMonitorRequestStop(unittest.TestCase):
         self.assertTrue(worker._stop.is_set())
         join_mock.assert_not_called()
         worker._thread.join.assert_not_called()
+
+
+class TestSystemHealthAndFixUI(unittest.TestCase):
+    """Dashboard System Health strip and Diagnostics 'How to fix' wiring."""
+
+    def setUp(self):
+        if not HAS_TK:
+            self.skipTest("Tkinter not available")
+        with patch.object(app_mod, "HAS_PSUTIL", False), \
+             patch.object(app_mod, "HAS_MPL", False), \
+             patch.object(app_mod.messagebox, "showwarning"), \
+             patch.object(app_mod.messagebox, "showinfo"), \
+             patch.object(app_mod.messagebox, "showerror"):
+            self.app = app_mod.ScannerApp()
+        self.addCleanup(self.app.destroy)
+
+    def _texts(self, widget):
+        texts = []
+        for child in widget.winfo_children():
+            try:
+                value = child.cget("text")
+            except Exception:  # noqa: BLE001 - widget without a text option
+                value = None
+            if isinstance(value, str):
+                texts.append(value)
+            texts.extend(self._texts(child))
+        return texts
+
+    def _fix_buttons(self, widget):
+        buttons = []
+        for child in widget.winfo_children():
+            if child.__class__.__name__ == "CTkButton":
+                buttons.append(child)
+            buttons.extend(self._fix_buttons(child))
+        return buttons
+
+    def test_fail_and_warning_findings_get_a_fix_button(self):
+        from scanner.diagnostics import Finding
+        findings = [
+            Finding("CPU", "FAIL", "too hot", key="CPU"),
+            Finding("Memory", "WARNING", "pressure", key="Memory"),
+            Finding("Network", "PASS", "ok", key="Network"),
+        ]
+        self.app._render_fix_buttons(findings)
+        buttons = self._fix_buttons(self.app.fix_frame)
+        self.assertEqual([b.cget("text") for b in buttons],
+                         ["How to fix", "How to fix"])
+        texts = self._texts(self.app.fix_frame)
+        self.assertTrue(any("[FAIL]" in t for t in texts))
+        self.assertTrue(any("[WARNING]" in t for t in texts))
+        self.assertFalse(any("[PASS]" in t for t in texts))
+
+    def test_no_actionable_findings_shows_an_honest_empty_state(self):
+        from scanner.diagnostics import Finding
+        self.app._render_fix_buttons(
+            [Finding("CPU", "PASS", "ok", key="CPU")])
+        self.assertIn("No FAIL or WARNING findings — nothing to fix.",
+                      self._texts(self.app.fix_frame))
+
+    def test_command_fix_is_copied_and_never_executed(self):
+        from scanner.diagnostics import Finding
+        finding = Finding("OS: systemd", "FAIL", "failed unit",
+                          key="OS:Systemd", code="SYSTEMD_FAILED")
+        with patch.object(self.app, "clipboard_clear"), \
+             patch.object(self.app, "clipboard_append") as append_mock, \
+             patch.object(app_mod.messagebox, "showinfo") as info_mock:
+            self.app._show_fix(finding)
+        append_mock.assert_called_once_with("systemctl --failed")
+        info_mock.assert_called_once()
+
+    def test_health_strip_renders_score_and_hides_os_before_a_scan(self):
+        from scanner.hardware import CpuSnapshot, HardwareSnapshot
+        self.app.latest_snap = HardwareSnapshot(
+            cpu=CpuSnapshot(available=True, percent=10.0))
+        self.app.latest_diag = None
+        self.app._update_system_health()
+        self.assertEqual(self.app.health_var.get(), "90")
+        self.assertIn("CPU 90", self.app.health_detail.cget("text"))
+        self.assertIn("run a scan for OS checks",
+                      self.app.health_detail.cget("text"))
+
+    def test_health_strip_includes_os_penalty_after_a_scan(self):
+        from scanner.diagnostics import DiagnosticReport, Finding
+        from scanner.hardware import CpuSnapshot, HardwareSnapshot
+        self.app.latest_snap = HardwareSnapshot(
+            cpu=CpuSnapshot(available=True, percent=0.0))
+        self.app.latest_diag = DiagnosticReport(findings=[
+            Finding("OS: Test", "FAIL", "x", key="OS:Test")])
+        self.app._update_system_health()
+        # CPU 100 (30%) + OS 90 (20%) renormalised over 0.5 -> 96.
+        self.assertEqual(self.app.health_var.get(), "96")
+        self.assertIn("OS 1 fail / 0 warn",
+                      self.app.health_detail.cget("text"))

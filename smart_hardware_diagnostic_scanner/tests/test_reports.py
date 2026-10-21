@@ -41,7 +41,7 @@ def demo_snapshot() -> HardwareSnapshot:
 class TestReports(unittest.TestCase):
     def test_build_and_json_roundtrip(self):
         snap = demo_snapshot()
-        diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS))
+        diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS), include_os=False)
         payload = build_report_dict(snap, diag, dict(DEFAULT_THRESHOLDS))
         text = json.dumps(payload)  # must be serialisable
         back = json.loads(text)
@@ -52,7 +52,7 @@ class TestReports(unittest.TestCase):
 
     def test_txt_render_contains_sections(self):
         snap = demo_snapshot()
-        diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS))
+        diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS), include_os=False)
         payload = build_report_dict(snap, diag, dict(DEFAULT_THRESHOLDS))
         txt = render_txt(payload)
         for section in ("FINDINGS", "RECOMMENDATIONS", "SUMMARY", "HARDWARE"):
@@ -67,7 +67,7 @@ class TestReports(unittest.TestCase):
 
     def test_save_json_txt_csv(self):
         snap = demo_snapshot()
-        diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS))
+        diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS), include_os=False)
         payload = build_report_dict(snap, diag, dict(DEFAULT_THRESHOLDS))
         with tempfile.TemporaryDirectory() as td:
             jp = Path(td) / "r.json"
@@ -85,7 +85,7 @@ class TestReports(unittest.TestCase):
 
     def test_invalid_suffix_rejected(self):
         snap = demo_snapshot()
-        diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS))
+        diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS), include_os=False)
         payload = build_report_dict(snap, diag, dict(DEFAULT_THRESHOLDS))
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(ValueError):
@@ -111,7 +111,7 @@ class TestReports(unittest.TestCase):
         with patch.object(hw, "HAS_PSUTIL", False), patch.object(hw, "psutil", None):
             snap = hw.collect_snapshot(include_gpu=False)
             self.assertFalse(snap.cpu.available)
-            diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS))
+            diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS), include_os=False)
             self.assertTrue(any(f.status == "UNAVAILABLE" for f in diag.findings))
 
 

@@ -22,7 +22,8 @@ from .charts import HAS_MPL, ChartPanel
 from . import ctk_widgets as ctkw
 from .actions import ACTION_LABELS, METRIC_LABELS, ActionRule, RuleEngine
 from .diagnostics import (DEFAULT_THRESHOLDS, DiagnosticReport, compare_reports,
-                          run_diagnostics)
+                          run_diagnostics, system_health_score)
+from .explainer import explain_finding
 from .filesutil import largest_files
 from .gpu import GpuStatus
 from .hardware import HAS_PSUTIL, HardwareSnapshot, collect_processes, collect_snapshot
@@ -272,6 +273,36 @@ class ScannerApp(ctk.CTk):
         return card, val, bar, detail, dot
 
     def _build_dashboard(self, page) -> None:
+        # "System Health": one combined 0-100 score across CPU, RAM, disk and
+        # the OS-level checks. It sits above the five metric cards so their
+        # tested single-row layout stays unchanged.
+        health = tk.Frame(page, bg=T.BG_CARD, highlightbackground=T.BORDER,
+                          highlightthickness=1)
+        health.pack(fill="x", pady=(0, 8))
+        left = tk.Frame(health, bg=T.BG_CARD)
+        left.pack(side="left", padx=12, pady=6)
+        tk.Label(left, text="SYSTEM HEALTH", bg=T.BG_CARD, fg=T.FG_MUTED,
+                 font=T.FONT_SMALL).pack(anchor="w")
+        score_row = tk.Frame(left, bg=T.BG_CARD)
+        score_row.pack(anchor="w")
+        self.health_var = tk.StringVar(value="—")
+        self.health_label = tk.Label(score_row, textvariable=self.health_var,
+                                     bg=T.BG_CARD, fg=T.FG_DIM,
+                                     font=(T.FONT_FAMILY, 22, "bold"))
+        self.health_label.pack(side="left")
+        tk.Label(score_row, text="/ 100", bg=T.BG_CARD, fg=T.FG_MUTED,
+                 font=T.FONT_SMALL).pack(side="left", anchor="s",
+                                         padx=(4, 0), pady=(0, 3))
+        self.health_bar = ctkw.make_progress(health, T.BG_CARD, height=10,
+                                             width=240)
+        self.health_bar.pack(side="left", fill="x", expand=True, padx=(4, 16))
+        self.health_bar.set(0)
+        self.health_detail = tk.Label(
+            health, text="Waiting for the first metrics sample…", bg=T.BG_CARD,
+            fg=T.FG_MUTED, font=T.FONT_SMALL, justify="left", anchor="w",
+            wraplength=320)
+        self.health_detail.pack(side="left", padx=(0, 12))
+
         # Cards sit in a single-row grid whose column widths are recomputed
         # from the row's actual pixel width on every resize, so all five
         # cards stay visible at any window size (default 1180 and min 960,
@@ -667,12 +698,18 @@ class ScannerApp(ctk.CTk):
         ctkw.make_button(row, "ghost", T.BG_MAIN, text="♥  Check SMART (smartctl)",
                          command=self.check_smart).pack(side="left", padx=(0, 8))
         ctkw.make_button(row, "ghost", T.BG_MAIN, text="Clear",
-                         command=lambda: self.diag_text.configure(state="normal") or
-                         self.diag_text.delete("1.0", "end") or
-                         self.diag_text.configure(state="disabled")).pack(side="left")
+                         command=self._clear_diagnostics_view).pack(side="left")
         self.scan_bar = ctkw.make_progress(row, T.BG_MAIN,
                                            mode="indeterminate", width=220)
         self.scan_bar.pack(side="right")
+        # "How to fix" rows for FAIL/WARNING findings; rebuilt after every scan.
+        self.fix_frame = tk.Frame(page, bg=T.BG_MAIN)
+        self.fix_frame.pack(fill="x", pady=(0, 6))
+        tk.Label(self.fix_frame,
+                 text="FAIL and WARNING findings will offer a 'How to fix' "
+                      "button after a scan.",
+                 bg=T.BG_MAIN, fg=T.FG_MUTED, font=T.FONT_SMALL,
+                 anchor="w").pack(fill="x")
         out_box = tk.Frame(page, bg=T.BG_OUTPUT, highlightbackground=T.BORDER,
                            highlightthickness=1)
         out_box.pack(fill="both", expand=True)
@@ -685,6 +722,119 @@ class ScannerApp(ctk.CTk):
         sb.pack(side="left", fill="y")
         for tag, colour in T.STATUS_COLOURS.items():
             self.diag_text.tag_configure(tag, foreground=colour)
+
+    def _clear_diagnostics_view(self) -> None:
+        try:
+            self.diag_text.configure(state="normal")
+            self.diag_text.delete("1.0", "end")
+            self.diag_text.configure(state="disabled")
+        except tk.TclError:
+            pass
+        for child in self.fix_frame.winfo_children():
+            child.destroy()
+
+    def _render_fix_buttons(self, findings) -> None:
+        """Rebuild the FAIL/WARNING rows with one 'How to fix' button each."""
+        frame = getattr(self, "fix_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        actionable = [f for f in findings if f.status in ("FAIL", "WARNING")]
+        # FAIL rows first: they are the ones that need attention now.
+        actionable.sort(key=lambda f: 0 if f.status == "FAIL" else 1)
+        if not actionable:
+            tk.Label(frame, text="No FAIL or WARNING findings — nothing to fix.",
+                     bg=T.BG_MAIN, fg=T.FG_MUTED, font=T.FONT_SMALL,
+                     anchor="w").pack(fill="x")
+            return
+        header_colour = (T.STATUS_COLOURS.get("FAIL", T.NEON_RED)
+                         if any(f.status == "FAIL" for f in actionable)
+                         else T.STATUS_COLOURS.get("WARNING", T.NEON_YELLOW))
+        tk.Label(
+            frame,
+            text="FAIL and WARNING findings need attention. 'How to fix' "
+                 "explains the problem and opens the right settings or copies a "
+                 "safe command — nothing is changed for you.",
+            bg=T.BG_MAIN, fg=header_colour, font=T.FONT_SMALL, anchor="w",
+            justify="left").pack(fill="x", pady=(0, 2))
+        for finding in actionable:
+            row = tk.Frame(frame, bg=T.BG_MAIN)
+            row.pack(fill="x", pady=1)
+            tk.Label(row,
+                     text=f"[{finding.status}] {finding.component}: "
+                          f"{finding.message}",
+                     bg=T.BG_MAIN,
+                     fg=T.STATUS_COLOURS.get(finding.status, T.FG_PRIMARY),
+                     font=T.FONT_SMALL, anchor="w", justify="left").pack(
+                         side="left", fill="x", expand=True)
+            ctkw.make_button(row, "ghost", T.BG_MAIN, text="How to fix",
+                             width=96,
+                             command=lambda f=finding: self._show_fix(f)).pack(
+                                 side="right", padx=(8, 0))
+
+    def _copy_to_clipboard(self, text: str) -> bool:
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+            return True
+        except tk.TclError:
+            return False
+
+    def _open_settings_uri(self, uri: str) -> bool:
+        """Open an OS settings page; never a shell, never a state change."""
+        system = platform.system()
+        try:
+            if system == "Windows" and hasattr(os, "startfile"):
+                os.startfile(uri)  # noqa: S606 - user-initiated settings page
+            else:
+                argv = (["open", uri] if system == "Darwin"
+                        else ["xdg-open", uri])
+                proc = subprocess.run(argv, shell=False, check=False,
+                                      capture_output=True, timeout=8)
+                if proc.returncode != 0:
+                    raise OSError(
+                        f"{argv[0]} exited with code {proc.returncode}")
+            return True
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("could not open settings URI %s: %s", uri, exc)
+            self._copy_to_clipboard(uri)
+            return False
+
+    def _show_fix(self, finding) -> None:
+        """Explain one FAIL/WARNING finding and perform its safe fix."""
+        explanation = explain_finding(finding)
+        if explanation is None:
+            self.set_status("No fix guidance needed for this finding.")
+            return
+        self._log(f"Fix guidance — {explanation.title}: "
+                  f"{explanation.explanation}", "INFO")
+        self._log(f"    {explanation.fix}", "INFO")
+        if explanation.kind == "uri" and explanation.target:
+            if self._open_settings_uri(explanation.target):
+                self.set_status(f"Opened settings: {explanation.title}")
+                messagebox.showinfo(
+                    explanation.title,
+                    f"{explanation.explanation}\n\n{explanation.fix}")
+            else:
+                self.set_status("Settings could not be opened — the address "
+                                "was copied to the clipboard instead.")
+            return
+        if explanation.kind == "command" and explanation.target:
+            copied = self._copy_to_clipboard(explanation.target)
+            self.set_status(
+                "Safe command copied to the clipboard — run it yourself if you "
+                "choose." if copied else "Could not copy the command.")
+            intro = ("Copied to your clipboard (nothing was run):"
+                     if copied else "Run this yourself if you choose:")
+            messagebox.showinfo(
+                explanation.title,
+                f"{explanation.explanation}\n\n{intro}\n\n"
+                f"{explanation.target}\n\n{explanation.fix}")
+            return
+        messagebox.showinfo(explanation.title,
+                            f"{explanation.explanation}\n\n{explanation.fix}")
 
     def _build_reports(self, page) -> None:
         ttk.Label(page, text="Reports, thresholds & safe tools", style="Head.TLabel").pack(anchor="w")
@@ -1142,7 +1292,50 @@ class ScannerApp(ctk.CTk):
             dot_n.configure(fg=T.FG_DIM)
             det_n.configure(text="counters unavailable")
         self.set_status(f"Updated {datetime.now().strftime('%H:%M:%S')} — host {snap.hostname}")
+        self._update_system_health()
         self.refresh_processes()
+
+    def _update_system_health(self) -> None:
+        """Recompute the dashboard System Health score (never raises)."""
+        score_var = getattr(self, "health_var", None)
+        if score_var is None:
+            return
+        findings = (self.latest_diag.findings
+                    if self.latest_diag is not None else None)
+        try:
+            health = system_health_score(self.latest_snap, findings)
+        except Exception:  # noqa: BLE001 - cosmetic; never break a refresh
+            log.debug("system health score failed", exc_info=True)
+            return
+        total = health.get("total")
+        if total is None:
+            score_var.set("—")
+            self.health_label.configure(fg=T.FG_DIM)
+            self.health_bar.set(0)
+            self.health_detail.configure(
+                text="Waiting for the first metrics sample…")
+            return
+        score_var.set(str(total))
+        if total >= 80:
+            colour = T.STATUS_COLOURS.get("PASS", T.NEON_GREEN)
+        elif total >= 60:
+            colour = T.STATUS_COLOURS.get("WARNING", T.NEON_YELLOW)
+        else:
+            colour = T.STATUS_COLOURS.get("FAIL", T.NEON_RED)
+        self.health_label.configure(fg=colour)
+        self.health_bar.configure(progress_color=colour)
+        self.health_bar.set(total)
+        parts = health.get("components", {})
+        bits = [f"{label} {parts[key]:.0f}"
+                for key, label in (("cpu", "CPU"), ("mem", "RAM"),
+                                   ("disk", "Disk")) if key in parts]
+        if "os" in parts:
+            bits.append(f"OS {health.get('os_fail', 0)} fail / "
+                        f"{health.get('os_warning', 0)} warn")
+            note = ""
+        else:
+            note = " · run a scan for OS checks"
+        self.health_detail.configure(text=" · ".join(bits) + note)
 
     def _apply_diag(self, diag: DiagnosticReport, payload: dict) -> None:
         # Compare against the previous scan *before* overwriting it.
@@ -1170,6 +1363,8 @@ class ScannerApp(ctk.CTk):
         s = diag.summary
         self._log(f"Summary: PASS={s.get('PASS',0)} WARNING={s.get('WARNING',0)} "
                   f"FAIL={s.get('FAIL',0)} UNAVAILABLE={s.get('UNAVAILABLE',0)}", "INFO")
+        self._render_fix_buttons(diag.findings)
+        self._update_system_health()
         self.set_status("Scan complete.")
         self.show_page("Diagnostics")
 

@@ -20,8 +20,21 @@ CustomTkinter UI.
   when `plyer` is installed (repeat alerts for the same component are limited by a
   2-minute cooldown). Can be switched off in the sidebar.
 - Live CPU + RAM chart when Matplotlib is installed (graceful fallback otherwise).
-- **Health score (0–100)** with a gauge on the Diagnostics page, a header chip and
-  a status-bar readout. Weights: FAIL −20, WARNING −7, UNAVAILABLE −2, PASS 0.
+- **System Health score (0–100)** on the Dashboard: combines CPU (30%), RAM (25%),
+  worst disk (25%) and OS-level findings (20%). Unavailable metrics are left out
+  and the remaining weights renormalise, so a missing sensor never pretends the
+  machine is broken; the OS share is excluded until a diagnostic scan has run.
+- **Cross-platform OS error detection** (read-only): the Windows Update service,
+  Defender real-time protection and the System Restore policy (Windows); `dmesg`
+  hardware errors, inode exhaustion (`df -i`) and failed systemd services
+  (Linux); recent unified-log errors and stale/missing Time Machine backups
+  (macOS). Every check uses explicit argv, `shell=False` and an 8-second timeout,
+  and missing/permission-denied commands degrade to UNAVAILABLE.
+- **Error Explainer + "How to fix"**: FAIL/WARNING findings get a plain-English
+  explanation and a safe, user-initiated action — opening the relevant settings
+  page (e.g. `ms-settings:windowsupdate`, Storage Sense) or copying a read-only
+  command (`df -i`, `systemctl --failed`, `dmesg --level=err,warn`). The app
+  never applies a fix by itself.
 - **Compare with last scan**: every scan is diffed against the previous one, listing
   regressions / improvements / new / resolved checks in the output.
 - **Save diff HTML**: a self-contained HTML document comparing the last two scans
@@ -132,6 +145,13 @@ own-PID/kernel-PID fence, and that the Master Switch blocks everything.
   (overridable on Linux/macOS via `XDG_DATA_HOME`)
 - UI/monospace fonts are chosen per OS (Segoe UI/Consolas, Helvetica Neue/Menlo,
   DejaVu Sans/DejaVu Sans Mono); Tk falls back to its default if one is absent.
+- OS-level checks are read-only and platform-specific:
+  - **Windows:** `wuauserv` (Windows Update), Defender real-time protection,
+    and the documented `DisableSR` System Restore policy value.
+  - **Linux:** `dmesg` hardware/segfault lines, inode usage from `df -i -P`,
+    and failed units from `systemctl --failed`.
+  - **macOS:** recent unified-log errors (`log show … --last 1h`) and the age of
+    the latest Time Machine backup (`tmutil latestbackup`).
 - What degrades per platform (honestly reported, never invented):
   - temperature sensors: unsupported on Windows/macOS stock Python
   - GPU metrics: NVIDIA via `nvidia-smi`, AMD via `rocm-smi`, Intel via
@@ -243,8 +263,9 @@ delete real files.
 - **Battery:** read via `psutil.sensors_battery()`. Desktops report UNSUPPORTED /
   UNAVAILABLE rather than an invented level, and "time remaining" is omitted when
   the OS does not provide it.
-- **Health score:** a documented penalty model (see Features), not a vendor
-  diagnostic. It summarises this app's own findings only.
+- **System Health score:** a documented 0–100 summary combining live metrics and
+  OS-level findings (see Features), not a vendor diagnostic. It summarises this
+  app's own checks only; UNAVAILABLE checks are never counted as failures.
 
 ## 9. Generate reports
 
@@ -323,7 +344,8 @@ smart_hardware_diagnostic_scanner/
     theme.py                  # dark/light palettes + per-OS fonts
     ctk_widgets.py            # CustomTkinter compat (0..100 progress bar, state helpers)
     actions.py                # Auto-Action Rules engine (The Kill Switch)
-    diagnostics.py
+    diagnostics.py            # thresholds + read-only OS checks + health score
+    explainer.py              # plain-English explanations + safe fixes
     hardware.py
     gpu.py                    # nvidia-smi / rocm-smi / intel_gpu_top chain
     monitoring.py
@@ -342,6 +364,7 @@ smart_hardware_diagnostic_scanner/
     test_app.py
     test_actions.py
     test_diagnostics.py
+    test_explainer.py
     test_hardware.py
     test_reports.py
     test_gpu.py
