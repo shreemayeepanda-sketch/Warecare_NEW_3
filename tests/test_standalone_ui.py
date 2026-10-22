@@ -146,32 +146,33 @@ def test_import_is_side_effect_free():
 
 
 # ---------------------------------------------------------------------------
-# 2. The icon renderer draws at the exact requested size
+# 2. The icon renderer: logical-size contract + HiDPI display-resolution bitmaps
 # ---------------------------------------------------------------------------
 def test_get_icon_renders_logical_size_exactly(app):
+    display_scale = ew.icons._HI_DPI_SCALE
     sizes = (8, 20, 22, 28, 37)
     for size in sizes:
         img = ew.icons.get_icon("dashboard", size, "#123456")
         # logical (display) size is exactly the requested size
         assert tuple(img.cget("size")) == (size, size)
-        # cached bitmap is square, RGBA, and fills both palette slots
+        # the cached bitmap is rendered at the physical resolution CTk shows
+        # it at (round(size * widget scaling); Windows defaults to 125%): a
+        # 1x bitmap would be upscaled on screen and blur the strokes
+        display_px = round(size * display_scale)
         bitmap = img.cget("light_image")
-        assert bitmap.size == (size, size)
+        assert bitmap.size == (display_px, display_px)
         assert bitmap.mode == "RGBA"
         assert img.cget("dark_image") is bitmap
         # aspect ratio preserved: square canvas -> square icon
         assert bitmap.width == bitmap.height
-        # painting stays inside the 24x24 design canvas (no overshoot)
+        # painting stays inside the supersampled design canvas (no overshoot)
         bbox = bitmap.getbbox()
         assert bbox is not None, "icon rendered empty"
         left, top, right, bottom = bbox
-        assert 0 <= left <= right <= size and 0 <= top <= bottom <= size
+        assert 0 <= left <= right <= display_px
+        assert 0 <= top <= bottom <= display_px
         # transparent canvas corners (stroke kept off the corners)
         assert bitmap.getpixel((0, 0))[3] == 0
-        # the bitmap must never be smaller than CTk's displayed size
-        # (CTk displays round(size * widget_scaling); a smaller bitmap would
-        # be lossy-upscaled — widget scaling is 1.25 on this machine)
-        assert bitmap.size[0] >= size
 
 
 def test_get_icon_display_size_matches_ctk_scaling(app):
@@ -186,11 +187,15 @@ def test_get_icon_display_size_matches_ctk_scaling(app):
 
 
 def test_get_icon_uses_the_colour_parameter(app):
-    # the monitor icon's solid hub must be painted in the requested colour.
+    # the monitor icon's solid hub sits at the centre of the 24x24 design
+    # grid, so the cached bitmap's centre pixel is the place to sample (the
+    # bitmap renders at round(size * _HI_DPI_SCALE), not the logical size).
     # Everything is Lanczos-downscaled with anti-aliasing (strokes are ~2px
     # at display size), so the centre pixel is compared with a tolerance.
     img = ew.icons.get_icon("monitor", 40, "#FF8800")
-    r, g, b, a = img.cget("light_image").getpixel((20, 20))
+    bitmap = img.cget("light_image")
+    c = bitmap.width // 2
+    r, g, b, a = bitmap.getpixel((c, c))
     assert a >= 200, "icon hub is not opaque"
     assert max(abs(r - 255), abs(g - 136), abs(b - 0)) <= 4
 
@@ -198,7 +203,9 @@ def test_get_icon_uses_the_colour_parameter(app):
 def test_get_icon_default_colour_is_the_active_palette(app):
     to_dark(app)
     img = ew.icons.get_icon("monitor", 40)      # default = active palette
-    r, g, b, a = img.cget("light_image").getpixel((20, 20))
+    bitmap = img.cget("light_image")            # centre = the monitor hub
+    c = bitmap.width // 2
+    r, g, b, a = bitmap.getpixel((c, c))
     hex_color = ew.T.NEON_CYAN                  # dark palette is the default
     expected = tuple(int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
     assert a >= 200
@@ -228,15 +235,19 @@ def test_get_icon_validates_and_caches(app):
     ew.icons.clear_cache()
     assert ew.icons._BITMAP_CACHE == {}
     img = ew.icons.get_icon("gpu", 24, "#ABC123")
-    assert img.cget("light_image").size == (24, 24)
+    bitmap_px = round(24 * ew.icons._HI_DPI_SCALE)
+    assert img.cget("light_image").size == (bitmap_px, bitmap_px)
 
 
 def test_every_painter_renders_small_and_large(app):
+    display_scale = ew.icons._HI_DPI_SCALE
     for name in ew.icons.ICON_NAMES:
         small = ew.icons.get_icon(name, 8, "#102030")
         large = ew.icons.get_icon(name, 64, "#102030")
-        assert small.cget("light_image").size == (8, 8)
-        assert large.cget("light_image").size == (64, 64)
+        small_px = round(8 * display_scale)
+        large_px = round(64 * display_scale)
+        assert small.cget("light_image").size == (small_px, small_px)
+        assert large.cget("light_image").size == (large_px, large_px)
         assert large.cget("light_image").getbbox() is not None
 
 

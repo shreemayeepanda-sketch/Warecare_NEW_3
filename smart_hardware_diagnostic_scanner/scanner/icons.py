@@ -33,6 +33,13 @@ __all__ = ["ICON_NAMES", "get_icon", "clear_cache"]
 #: Draw at 4x and downscale — smooth, anti-aliased edges at any display size.
 _SUPERSAMPLE = 4
 
+#: Cached bitmaps are rendered at `_HI_DPI_SCALE`x the logical size — the
+#: physical resolution CTk displays them at (Windows' default widget scaling
+#: is 125%). Tk would otherwise upscale the 1x bitmap on screen and blur the
+#: anti-aliased strokes; on unscaled (100%) displays the slightly larger
+#: bitmap is gently downscaled instead, which stays crisp.
+_HI_DPI_SCALE = 1.25
+
 #: Stroke width in design units (24-unit grid). ~2 units reads well at 20 px.
 STROKE_UNITS = 2.2
 
@@ -248,9 +255,11 @@ CARD_ICONS = {
 def get_icon(name: str, size: int = 24, color: str | None = None) -> "ctk.CTkImage":
     """Render one vector icon as a `customtkinter.CTkImage`.
 
-    `name` must be one of `ICON_NAMES`. `size` is the display size in
-    pixels (the bitmap is drawn at size * _SUPERSAMPLE and downscaled).
-    `color` is any Tk/PIL hex colour; it defaults to the active palette's
+    `name` must be one of `ICON_NAMES`. `size` is the *logical* display
+    size in pixels: the bitmap is drawn at size * _SUPERSAMPLE and
+    downscaled to round(size * _HI_DPI_SCALE) — the physical resolution
+    CTk displays it at on scaled screens. `color` is any Tk/PIL hex
+    colour; it defaults to the active palette's
     neon cyan accent. The rendered bitmap is cached per (name, size,
     colour); the returned `CTkImage` is always fresh, so every Tk root can
     bind its own `PhotoImage`s to it.
@@ -271,7 +280,8 @@ def get_icon(name: str, size: int = 24, color: str | None = None) -> "ctk.CTkIma
         unit = px / 24.0  # one design unit in supersampled pixels
         lw = max(1, round(STROKE_UNITS * unit))  # Pillow needs int widths
         painter(draw, unit, lw, color)
-        bitmap = img.resize((size, size), Image.Resampling.LANCZOS)
+        bitmap_px = round(size * _HI_DPI_SCALE)
+        bitmap = img.resize((bitmap_px, bitmap_px), Image.Resampling.LANCZOS)
         _BITMAP_CACHE[key] = bitmap
     return ctk.CTkImage(light_image=bitmap, dark_image=bitmap, size=(size, size))
 

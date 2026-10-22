@@ -595,10 +595,14 @@ class TestVectorIcons(unittest.TestCase):
         self.assertIsNot(again.cget("light_image"), first.cget("light_image"))
 
     def test_bitmaps_are_squares_with_transparent_corners(self):
+        # Bitmaps are cached at round(size * _HI_DPI_SCALE) — the physical
+        # resolution CTk displays them at on scaled (>=125%) screens — so Tk
+        # shows the strokes 1:1 instead of badly upscaling a 1x bitmap.
+        display_px = round(20 * icons_mod._HI_DPI_SCALE)
         for name in icons_mod.ICON_NAMES:
             bitmap = icons_mod.get_icon(name, 20, "#000000").cget("light_image")
             with self.subTest(name=name):
-                self.assertEqual(bitmap.size, (20, 20))
+                self.assertEqual(bitmap.size, (display_px, display_px))
                 self.assertEqual(bitmap.mode, "RGBA")
                 self.assertEqual(bitmap.getpixel((0, 0))[3], 0,
                                  "icon left a stroke at the canvas corner")

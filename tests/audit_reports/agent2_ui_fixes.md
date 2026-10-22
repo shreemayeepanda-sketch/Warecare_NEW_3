@@ -340,3 +340,30 @@ runtime ~26 s (< 90 s budget).
 - Icon source of truth: `get_icon`/`clear_cache` region 4404–4437 + `_PAINTERS`
   (4159–4437) are byte-identical to `scanner/icons.py`; coordinate any edit with the
   package and re-verify byte-identity after Agent 4's pass.
+
+---
+
+## Post-audit resolution (Bug 5 — HiDPI — applied)
+
+Deferred no longer; applied in a follow-up commit with the package updated in the
+same change so the two icon copies stay byte-identical:
+
+- `scanner/icons.py` and the flattened `ewarecare.py` copy both gain
+  `_HI_DPI_SCALE = 1.25`; the cached bitmap is downscaled to
+  `round(size * _HI_DPI_SCALE)` while `CTkImage(size=(size, size))` keeps the
+  logical size. Tk therefore renders the strokes 1:1 at the Windows-default 125%
+  scaling instead of losslessly upscaling a 1x bitmap (on unscaled 100% displays
+  the slightly larger bitmap is gently downscaled — still crisp). Chosen over the
+  "derive widget scaling per call site" shape noted above because `get_icon` is
+  widget-free and the cache key remains `(name, size, color)`.
+- Contract tests updated for the new contract: the pinned bitmap-size assertion in
+  `scanner/tests/test_app.py::test_bitmaps_are_squares_with_transparent_corners`
+  (now `round(20 * _HI_DPI_SCALE)` = (25, 25)), the bitmap-size pins and bbox
+  bounds in `tests/test_standalone_ui.py`, and the two monitor-hub colour-sampling
+  tests (now sample the bitmap centre, since `getpixel((20, 20))` assumed the
+  bitmap equalled the logical size).
+- Verification after the change: focused run (`test_app.py` + standalone UI) and
+  the **full suite: 545 passed, 36 subtests**; sub-window checks re-ran clean and a
+  live launch of `python ewarecare.py` stayed windowed/planned-alive 12 s with
+  byte-empty stdout/stderr. The two icon sections were re-verified in sync
+  (identical `_HI_DPI_SCALE` reference counts and key lines in both copies).
