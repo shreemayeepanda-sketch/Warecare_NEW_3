@@ -2366,7 +2366,7 @@ def render_comparison_html(comparison: dict,
                ("removed", "No longer reported", "b-UNAVAILABLE")]
     sections: list[str] = []
     total_changes = 0
-    for bucket, heading, colour_class in buckets:
+    for bucket, heading, _colour_class in buckets:
         rows = comparison.get(bucket, []) or []
         total_changes += len(rows)
         if not rows:
@@ -3125,7 +3125,6 @@ def check_for_update(url: str | None = None,
 # These builders are pure; the caller owns the subprocess and confirmation.
 # ---------------------------------------------------------------------------
 SCHEDULE_MARKER = "# SHDS weekly scan (added by Smart Hardware Diagnostic Scanner)"
-SCHEDULE_INTRO = "# SHDS weekly scan"
 VALID_DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 SCHTASKS_TASK_NAME = "SHDS weekly scan"
 
@@ -5004,7 +5003,7 @@ class ScannerApp(tk.Tk):
 
     def _apply_snapshot(self, snap: HardwareSnapshot) -> None:
         self.latest_snap = snap
-        val_cpu, bar_cpu, det_cpu, dot_cpu = self.cards["CPU"]
+        val_cpu, _bar_cpu, det_cpu, dot_cpu = self.cards["CPU"]
         self._draw_cores(self.cores_canvas, snap.cpu.per_core)
         if snap.cpu.available and snap.cpu.percent is not None:
             val_cpu.configure(text=f"{snap.cpu.percent:.1f} %")

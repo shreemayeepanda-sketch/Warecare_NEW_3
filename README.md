@@ -7,6 +7,20 @@ CPU, RAM, GPU, disks, network, processes and sensors, runs a modular diagnostic 
 shows live charts, and exports JSON / TXT / CSV reports — all in a dark-neon
 CustomTkinter UI.
 
+## Repository layout
+
+This repository contains two builds of the scanner:
+
+- `ewarecare.py` — the standalone single-file build, packaged by `ewarecare.spec`
+  as `dist\ewarecare.exe`; its tests are in `tests/`.
+- `smart_hardware_diagnostic_scanner/` — the modular package (`main.py` +
+  `scanner/`) and the earlier `shds_gui.py` single-file build. Its documentation,
+  launchers and tests live in that folder.
+
+The documentation below describes the modular build in
+`smart_hardware_diagnostic_scanner/`; commands that `cd` into that folder are
+intentional.
+
 ## 1. Features
 
 - Dashboard cards for CPU, RAM, GPU, Disk, Network with progress bars + status dots.

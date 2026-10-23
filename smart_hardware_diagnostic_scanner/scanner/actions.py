@@ -58,8 +58,6 @@ PROTECTED_PROCESS_NAMES = frozenset({
 # Lowest PID value that may be terminated (0/4 are kernel on Windows).
 _MIN_KILLABLE_PID = 5
 
-METRIC_ATTRS = {"cpu": "cpu", "mem": "mem", "disk": "disks"}
-
 
 def is_protected_process(name: str | None) -> bool:
     """True when a process must never be terminated."""

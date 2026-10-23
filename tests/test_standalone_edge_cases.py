@@ -24,7 +24,7 @@ decoding contract test, which runs a harmless child of THIS interpreter
 (``sys.executable -c``) writing a few invalid byte sequences to stdout —
 no OS diagnostic command, no network access, no process management.
 
-BUG numbering matches ``tests/audit_reports/agent3_edge_fixes.md``:
+BUG numbering matches the historical edge-case audit (Agent 3):
   BUG-1 non-UTF-8 command output crashes / vanishes in ``_run_readonly``
   BUG-2 no hard floor under ``PROTECTED_PROCESS_NAMES``
   BUG-3 ``ActionRule(duration_s <= 0)`` accepted → instant kill on first tick
@@ -451,6 +451,11 @@ class TestProtectedFloor(unittest.TestCase):
         engine.rules.append(rule)
         engine.enabled = True
         mock_psutil = MagicMock()
+        # The engine re-validates the LIVE process name before terminating
+        # (PID-reuse safety); a bare MagicMock would hand back a non-string
+        # name, which is_protected_process deliberately refuses, so give the
+        # mock the identity the snapshot claimed.
+        mock_psutil.Process.return_value.name.return_value = "chrome.exe"
         with patch.object(ewarecare, "HAS_PSUTIL", True), \
              patch.object(ewarecare, "psutil", mock_psutil), \
              patch.object(ewarecare, "PROTECTED_PROCESS_NAMES", frozenset()):

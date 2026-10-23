@@ -51,8 +51,10 @@ except ImportError:  # optional dependency
 
 try:
     import winreg
+    HAS_WINREG = True
 except ImportError:  # Windows-only stdlib module
     winreg = None  # type: ignore
+    HAS_WINREG = False
 
 
 class _ModuleNamespace:
@@ -86,10 +88,6 @@ CTk look is defined.
 __version__ = "1.0.0"
 APP_VERSION = __version__
 
-
-import platform
-
-import customtkinter as ctk
 
 # Font selection: pick families that exist on the current OS; Tk silently
 # falls back to its default when a family is missing, so these are hints,
@@ -130,7 +128,6 @@ PALETTE_KEYS = (
 # active item gets a solid highlight. "transparent" is a valid CustomTkinter
 # colour (the widget then paints its parent's colour) but not a Tk colour, so
 # it lives only in the BTN_* widget keys.
-_SIDE_TRANSPARENT = "transparent"
 
 _DARK_PALETTE = {
     # Backgrounds. BG_CARD (#1C1C28) is shared by the widgets' ghost styling —
@@ -562,11 +559,6 @@ CARD_HEIGHT = 150
 
 """Small shared utilities: formatting, validation, platform helpers."""
 
-import math
-import shutil
-import sys
-from pathlib import Path
-
 
 def format_bytes(num: float) -> str:
     """Format a byte count as a human readable string."""
@@ -579,6 +571,13 @@ def format_bytes(num: float) -> str:
     units = ["B", "KB", "MB", "GB", "TB", "PB"]
     idx = 0
     while value >= 1024.0 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
+    # A value just under a unit boundary can round UP to "1024.00" during
+    # formatting (e.g. 1048575.998976 B -> 1023.999999 KB shows as
+    # "1024.00 KB"); promote it one unit so the display stays sane.
+    if (idx > 0 and idx < len(units) - 1
+            and float(f"{value:.2f}") >= 1024.0):
         value /= 1024.0
         idx += 1
     if idx == 0:
@@ -606,10 +605,6 @@ def python_info() -> str:
     return sys.version.replace("\n", " ")
 
 
-def os_info() -> str:
-    return f"{platform.system()} {platform.release()} ({platform.version()}) / {platform.machine()}"
-
-
 def which(cmd: str) -> str | None:
     """Return full path of a command or None (no shell involved)."""
     try:
@@ -625,9 +620,15 @@ def safe_path_for_report(path_str: str, allowed_dir: Path | None = None) -> Path
     """
     if not path_str or not path_str.strip():
         raise ValueError("Empty file path.")
+    if "\x00" in path_str:
+        raise ValueError("Path contains a NUL byte.")
     path = Path(path_str).expanduser()
     if path.suffix.lower() not in {".json", ".txt", ".csv", ".html"}:
         raise ValueError("Report path must end with .json, .txt, .csv or .html")
+    # An existing directory would fail later with a confusing
+    # IsADirectoryError when the report is written; reject it here.
+    if path.is_dir():
+        raise ValueError("Path is an existing directory.")
     if allowed_dir is not None:
         try:
             path.resolve().relative_to(allowed_dir.resolve())
@@ -644,11 +645,6 @@ def safe_path_for_report(path_str: str, allowed_dir: Path | None = None) -> Path
 Optional tools, never fabricated. All queries use explicit argv + shell=False
 + a timeout and never raise: failures degrade to unavailable/unsupported.
 """
-
-import json
-import logging
-import subprocess
-from dataclasses import dataclass, field
 
 
 log_gpu = logging.getLogger("shds.gpu")
@@ -684,13 +680,77 @@ class GpuStatus:
 
 
 def _to_float(raw: str) -> float | None:
-    text = (raw or "").strip().lower().replace("w", "").replace("%", "").replace("c", "")
+    # Some nvidia-smi locales emit thousands separators ("1,024"); the value
+    # may also still carry the CSV quoting.
+    text = (raw or "").strip().replace(",", "").replace('"', "").lower().replace("w", "").replace("%", "").replace("c", "")
     if text in ("", "n/a", "unknown", "[n/a]", "n/a.", "none"):
         return None
     try:
         return float(text)
     except ValueError:
         return None
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Best-effort kill of a probe process and everything it spawned.
+
+    subprocess.run() only kills the direct child; an orphaned grandchild that
+    inherited stdout/stderr keeps the pipes open and can make the final
+    communicate() block forever.
+    """
+    try:
+        import psutil  # optional dependency; missing installs fall through
+    except ImportError:
+        psutil = None  # type: ignore[assignment]
+    if psutil is not None and hasattr(psutil, "Process"):
+        try:
+            parent = psutil.Process(proc.pid)
+            for child in parent.children(recursive=True):
+                try:
+                    child.kill()
+                except psutil.Error:
+                    pass
+        except Exception:  # race with an already-exited tree; keep going
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_probe(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """Run one probe tool under a hard total timeout; never hang.
+
+    Like subprocess.run(shell=False) but the timeout also bounds the pipe
+    drain: on TimeoutExpired the whole process tree is killed and the last
+    read is deadline-limited, so a grandchild holding the pipes cannot block
+    the caller forever. The re-raised TimeoutExpired still carries any partial
+    stdout so intel_gpu_top's expected-timeout parsing keeps working.
+    """
+    proc = subprocess.Popen(
+        argv,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=1)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # Pipes still wedged by an orphan: lose the output, not the thread.
+            stdout, stderr = "", ""
+        raise subprocess.TimeoutExpired(
+            argv, timeout, output=stdout or "", stderr=stderr or "") from None
+    returncode = proc.returncode if proc.returncode is not None else 0
+    return subprocess.CompletedProcess(argv, returncode, stdout or "", stderr or "")
 
 
 def query_nvidia_gpus(timeout: int = NVIDIA_SMI_TIMEOUT) -> GpuStatus:
@@ -711,7 +771,7 @@ def query_nvidia_gpus(timeout: int = NVIDIA_SMI_TIMEOUT) -> GpuStatus:
         "--format=csv,noheader,nounits",
     ]
     try:
-        proc = subprocess.run(argv, shell=False, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        proc = _run_probe(argv, timeout)
     except FileNotFoundError:
         status.message = "nvidia-smi executable disappeared."
         return status
@@ -734,17 +794,28 @@ def query_nvidia_gpus(timeout: int = NVIDIA_SMI_TIMEOUT) -> GpuStatus:
         return status
     gpus: list[GpuInfo] = []
     for line in lines:
-        parts = [p.strip() for p in line.split(",")]
+        # Values can be quoted with thousands separators ("1,024"), so a
+        # naive split would shift every column after the quoted field.
+        try:
+            parts = [p.strip() for p in next(csv.reader([line], skipinitialspace=True))]
+        except (csv.Error, StopIteration):
+            parts = [p.strip() for p in line.split(",")]
         # pad to 8 columns
         while len(parts) < 8:
             parts.append("")
         try:
-            idx = int(float(parts[0])) if parts[0] not in ("", "N/A") else len(gpus)
-        except ValueError:
-            idx = len(gpus)
+            idx = int(float(parts[0]))
+        except (ValueError, TypeError):
+            idx = None
+        name = parts[1]
+        if idx is None and not name:
+            # Not a device row (e.g. an error banner without commas): skip it
+            # instead of fabricating an unknown, fully-N/A GPU.
+            log_gpu.debug("nvidia-smi row is not a device: %r", line[:80])
+            continue
         gpu = GpuInfo(
-            index=idx,
-            name=parts[1] or "Unknown NVIDIA GPU",
+            index=idx if idx is not None else len(gpus),
+            name=name or "Unknown NVIDIA GPU",
             utilization_pct=_to_float(parts[2]),
             temperature_c=_to_float(parts[3]),
             memory_used_mb=_to_float(parts[4]),
@@ -754,6 +825,9 @@ def query_nvidia_gpus(timeout: int = NVIDIA_SMI_TIMEOUT) -> GpuStatus:
             available=True,
         )
         gpus.append(gpu)
+    if not gpus:
+        status.message = "nvidia-smi returned no parsable GPU rows."
+        return status
     status.supported = True
     status.gpus = gpus
     status.message = f"Found {len(gpus)} NVIDIA GPU(s)."
@@ -780,7 +854,7 @@ def query_rocm_gpus(timeout: int = NVIDIA_SMI_TIMEOUT) -> GpuStatus:
     status.tool_found = True
     argv = [exe, "--showtemp", "--showuse", "--showmemuse", "--json"]
     try:
-        proc = subprocess.run(argv, shell=False, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        proc = _run_probe(argv, timeout)
     except FileNotFoundError:
         status.message = "rocm-smi executable disappeared."
         return status
@@ -832,6 +906,7 @@ def query_rocm_gpus(timeout: int = NVIDIA_SMI_TIMEOUT) -> GpuStatus:
             temperature_c=temp,
             memory_used_mb=mem_used,
             available=True,
+            source="rocm-smi",
         ))
     if not gpus:
         status.message = "rocm-smi returned no GPU cards."
@@ -860,7 +935,7 @@ def query_intel_gpus(timeout: int = 3) -> GpuStatus:
     stdout = ""
     timed_out = False
     try:
-        proc = subprocess.run(argv, shell=False, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        proc = _run_probe(argv, timeout)
         stdout = proc.stdout or ""
         if proc.returncode != 0:
             err = (proc.stderr or "").strip()[:300]
@@ -903,7 +978,7 @@ def query_intel_gpus(timeout: int = 3) -> GpuStatus:
         return status
     status.supported = True
     status.gpus = [GpuInfo(index=0, name="Intel GPU", utilization_pct=util,
-                           available=True)]
+                           available=True, source="intel_gpu_top")]
     status.message = "Found 1 Intel GPU via intel_gpu_top."
     return status
 
@@ -932,17 +1007,6 @@ def query_gpus(timeout: int = NVIDIA_SMI_TIMEOUT) -> GpuStatus:
 
 
 """Hardware snapshot collection (psutil-based, fully defensive)."""
-
-import socket
-import threading
-import time
-
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:  # optional dependency
-    psutil = None  # type: ignore
-    HAS_PSUTIL = False
 
 
 log_hardware = logging.getLogger("shds.hardware")
@@ -1127,6 +1191,17 @@ def collect_disks() -> list[DiskEntry]:
             entry.used = int(usage.used)
             entry.free = int(usage.free)
             entry.percent = float(usage.percent)
+            # Windows can hand back numbers for FAT/exFAT volumes that do not
+            # add up (used + free > total, or a percent outside 0..100).
+            # Clamp them so every entry is self-consistent instead of letting
+            # a UI bar draw negative space or more than 100%.
+            if entry.total > 0:
+                entry.used = min(max(entry.used, 0), entry.total)
+                entry.free = min(max(entry.free, 0), entry.total)
+                if entry.used + entry.free > entry.total:
+                    entry.free = entry.total - entry.used
+                if entry.percent is None or not (0.0 <= entry.percent <= 100.0):
+                    entry.percent = round(entry.used / entry.total * 100.0, 1)
             entry.accessible = True
         except PermissionError as exc:
             entry.error = f"Permission denied: {exc}"
@@ -1232,12 +1307,21 @@ def collect_processes(limit: int = 12, sort_by: str = "cpu") -> list[ProcEntry]:
         for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
             try:
                 info = p.info
+                pid = int(info.get("pid", 0))
+                name = str(info.get("name", "?"))[:60]
+                # pid 0 on Windows is the idle pseudo-process: psutil reports
+                # its cpu_percent as the summed idle time of every logical
+                # core, so it reads far above 100% (observed 1292.4% live)
+                # and pins itself at the top of the table and of the kill
+                # candidate list, displacing a real process each poll.
+                if pid == 0 or name.lower() == "system idle process":
+                    continue
                 mem_mb = 0.0
                 if info.get("memory_info"):
                     mem_mb = float(info["memory_info"].rss) / (1024 * 1024)
                 procs.append(ProcEntry(
-                    pid=int(info.get("pid", 0)),
-                    name=str(info.get("name", "?"))[:60],
+                    pid=pid,
+                    name=name,
                     cpu=float(info.get("cpu_percent") or 0.0),
                     mem_mb=round(mem_mb, 1),
                 ))
@@ -1280,7 +1364,6 @@ def collect_snapshot(include_gpu: bool = True) -> HardwareSnapshot:
 
 
 """SMART disk health via smartctl (optional tool, honest degradation)."""
-
 
 
 log_smart = logging.getLogger("shds.smart")
@@ -1330,21 +1413,41 @@ def health_argv(exe: str, device: str, dev_type: str | None = None) -> list[str]
 def classify_smart_exit(code: int) -> str:
     """Map a smartctl exit code to PASS/FAIL/UNAVAILABLE.
 
-    smartctl exits with a bitfield, and this mapping is deliberately coarse:
+    smartctl exits with a bitfield (smartctl man page, "EXIT STATUS"):
 
-    - bit 3 (value 8) means "SMART health of the device failed" -> "FAIL"
-      (other set bits alongside 8 are checksum/attribute details, not
-      stronger verdicts, so 8|1 -> "FAIL" too);
+    - bit 3 (value 8) means SMART status returned "DISK FAILING" -> "FAIL";
+      a "-H" health query sets bit 3 for every failing verdict, even when
+      that verdict is based on the attribute fallback (bit 4), so 8|1
+      ("FAIL" plus a stray command-line bit) is a "FAIL" too;
     - exit code 0 means the device passed -> "PASS";
-    - anything else (command line errors, permission problems, unsupported
-      device, firmware quirks) means no health verdict was obtained and is
-      reported honestly as "UNAVAILABLE" instead of guessed.
+    - bit 5 (value 32) is documented as: SMART status check returned
+      "DISK OK" but some attributes were <= threshold sometime in the
+      past, so a verdict WAS obtained and is still a "PASS" (with the
+      marginal-attribute caveat recorded in detail);
+    - bits 0-2 (value 1/2/4: command line did not parse, device open
+      failed, SMART command failed) mean no health verdict was obtained
+      -> "UNAVAILABLE";
+    - a negative code is not a bitfield (the child was signalled on POSIX
+      or died on a Windows NTSTATUS) -> "UNAVAILABLE" as well;
+    - bits 6/7 (value 64/128: error / self-test log contains records) are
+      informational and do not overturn a passed verdict; a lone bit 4
+      (value 16) only occurs when no "-H" query ran and is treated as no
+      verdict, reported honestly as "UNAVAILABLE" instead of guessed.
     """
-    if code & 8:
+    if code < 0:      # not a bitfield: killed or abnormally terminated
+        return "UNAVAILABLE"
+    if code & 8:      # bit 3: health FAILED (beats all informational bits)
         return "FAIL"
-    if code == 0:
+    if code & 7:      # bits 0-2: no health verdict possible
+        return "UNAVAILABLE"
+    if code & 16:     # bit 4 alone: attribute-check output, no -H verdict
+        return "UNAVAILABLE"
+    if code == 0:     # clean health pass
         return "PASS"
-    return "UNAVAILABLE"
+    # Only documented informational bits remain (32: "DISK OK" with
+    # attributes below threshold in the past; 64/128: log records) - the
+    # health status itself was read and read PASSED.
+    return "PASS"
 
 
 def _first_line(text: str | None) -> str:
@@ -1396,6 +1499,8 @@ def _model_of(text: str | None) -> str:
     smartctl prints "Model Family" *before* "Device Model", so the first line
     mentioning "model" is usually the generic family string. Prefer the real
     device model and fall back to the family only when it is all we have.
+    NVMe devices print "Model Number:" instead of "Device Model:" (and have
+    no "Model Family"), so that key counts as a device model too.
     """
     family = ""
     for line in (text or "").splitlines():
@@ -1406,11 +1511,24 @@ def _model_of(text: str | None) -> str:
         value = value.strip()
         if not value:
             continue
-        if key == "device model":
+        if key in ("device model", "model number"):
             return value[:80]
         if key == "model family" and not family:
             family = value[:80]
     return family
+
+
+def _subprocess_quiet_flags() -> dict[str, int]:
+    """kwargs that keep a console child (smartctl) invisible under a GUI (win32).
+
+    When this app runs as a windowed process (pythonw or the packaged exe)
+    there is no inherited console, so the console-subsystem smartctl child
+    would open its own visible console window for every scan/query. Platform
+    independent: an empty dict everywhere else.
+    """
+    if sys.platform != "win32":
+        return {}
+    return {"creationflags": subprocess.CREATE_NO_WINDOW}
 
 
 def _health_check(exe: str, device: str, timeout: int,
@@ -1419,7 +1537,8 @@ def _health_check(exe: str, device: str, timeout: int,
     row = SmartDevice(device=device, status="UNAVAILABLE")
     try:
         proc = subprocess.run(health_argv(exe, device, dev_type), shell=False,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                              **_subprocess_quiet_flags())
     except FileNotFoundError:
         row.detail = "smartctl executable disappeared."
     except subprocess.TimeoutExpired:
@@ -1452,7 +1571,8 @@ def query_smart_devices(timeout: int = SMARTCTL_TIMEOUT,
     status.tool_found = True
     try:
         proc = subprocess.run(scan_argv(exe), shell=False, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace", timeout=timeout)
+                              text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                              **_subprocess_quiet_flags())
     except FileNotFoundError:
         status.message = "smartctl executable disappeared."
         return status
@@ -1493,15 +1613,6 @@ def query_smart_devices(timeout: int = SMARTCTL_TIMEOUT,
 
 
 """Per-process network connections via psutil (read-only)."""
-
-from typing import Iterable
-
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:  # optional dependency
-    psutil = None  # type: ignore
-    HAS_PSUTIL = False
 
 log_netview = logging.getLogger("shds.netview")
 
@@ -1552,16 +1663,6 @@ def _socket_kind(value) -> str:
         return str(value)
 
 
-def _addr_port(addr) -> int:
-    """The port part of a psutil address tuple (-1 when unusable)."""
-    if not addr or len(addr) < 2:
-        return -1
-    try:
-        return int(addr[1])
-    except (TypeError, ValueError):
-        return -1
-
-
 def _conn_row(c, names: dict[int, str]) -> ConnRow:
     """One ConnRow from a psutil connection entry (never signals)."""
     pid = int(getattr(c, "pid", 0) or 0)
@@ -1575,15 +1676,21 @@ def _conn_row(c, names: dict[int, str]) -> ConnRow:
     )
 
 
-def _sort_key(row: ConnRow) -> tuple[int, int, str]:
-    """TCP ESTABLISHED first, then other TCP, then UDP; then by pid."""
+def _sort_key(row: ConnRow) -> tuple[int, int, str, str, str]:
+    """TCP ESTABLISHED first, then other TCP, then UDP; then by pid/local.
+
+    remote and status are appended as tie-breakers so that two rows with the
+    same pid and local address (e.g. one listener, several peers) keep a
+    deterministic, repeatable order instead of psutil's arbitrary snapshot
+    order.
+    """
     if row.kind == "TCP" and row.status == "ESTABLISHED":
         group = 0
     elif row.kind == "TCP":
         group = 1
     else:
         group = 2
-    return (group, row.pid, row.local)
+    return (group, row.pid, row.local, row.remote, row.status)
 
 
 def _name_for(pid: int) -> str:
@@ -1646,17 +1753,6 @@ only reports what it finds. Every public function is safe to call from a
 background thread and never raises: failures degrade into notes.
 """
 
-import os
-import plistlib
-from collections.abc import Callable
-
-try:
-    import winreg
-    HAS_WINREG = True
-except ImportError:  # Windows-only stdlib module
-    winreg = None  # type: ignore
-    HAS_WINREG = False
-
 log_startup = logging.getLogger("shds.startup")
 
 _RUN_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -1693,6 +1789,11 @@ def _win_registry_entries() -> tuple[list[StartupEntry], str]:
         return [], "winreg unavailable (not Windows) — registry entries skipped."
     entries: list[StartupEntry] = []
     errors: list[str] = []
+    # (key path, value name, command) of values already reported: the default
+    # view is an alias of one of the explicit WOW64 views, and shared keys
+    # such as HKCU\...\Run return identical values in every view, so without
+    # this the same autorun value is listed twice or three times.
+    seen: set[tuple[str, str, str]] = set()
     hives = (
         ("HKCU", winreg.HKEY_CURRENT_USER),
         ("HKLM", winreg.HKEY_LOCAL_MACHINE),
@@ -1716,12 +1817,28 @@ def _win_registry_entries() -> tuple[list[StartupEntry], str]:
                         while True:
                             try:
                                 name, command, _vtype = winreg.EnumValue(key, index)
-                            except OSError:
+                            except OSError as exc:
+                                # winerror 259 (ERROR_NO_MORE_ITEMS) is the
+                                # normal end of the value list. Anything else
+                                # (e.g. AccessDenied) is a real failure: record
+                                # it instead of silently dropping values.
+                                if getattr(exc, "winerror", 259) != 259:
+                                    errors.append(f"{full}{view_label}: {exc}")
+                                    log_startup.info(
+                                        "cannot enumerate registry values in"
+                                        " %s: %s", full, exc)
                                 break
                             index += 1
+                            if isinstance(command, bytes):
+                                command = command.decode("utf-8", "replace")
+                            command = str(command or "").strip()
+                            dup_key = (full, str(name or ""), command)
+                            if dup_key in seen:
+                                continue  # same value via an aliased view
+                            seen.add(dup_key)
                             entries.append(StartupEntry(
                                 name=str(name or ""),
-                                command=str(command or "").strip(),
+                                command=command,
                                 source=full + view_label,
                                 kind="registry",
                             ))
@@ -1749,12 +1866,23 @@ def _win_startup_folder_entries() -> tuple[list[StartupEntry], str]:
         return [], ""  # folder does not exist yet — nothing to report
     except OSError as exc:
         return [], f"Cannot read startup folder {folder}: {exc}"
+    # Hidden and system files (desktop.ini and friends) are Start-menu
+    # metadata; Windows never launches them from the Startup folder, so they
+    # are reported neither as programs nor in the count. The mask is 0 on
+    # POSIX paths (st_file_attributes is Windows-only), keeping the check
+    # cross-platform coherent.
+    import stat as _stat
+    hidden_mask = (getattr(_stat, "FILE_ATTRIBUTE_HIDDEN", 0x2)
+                   | getattr(_stat, "FILE_ATTRIBUTE_SYSTEM", 0x4))
     entries: list[StartupEntry] = []
     for path in paths:
         try:
             if path.is_symlink() or not path.is_file():
                 continue
+            st = path.stat()
         except OSError:
+            continue
+        if getattr(st, "st_file_attributes", 0) & hidden_mask:
             continue
         entries.append(StartupEntry(
             name=path.stem,
@@ -1989,8 +2117,6 @@ bombs cannot loop the walk. The function is safe to call from a background
 thread and never raises: failures degrade into the note string.
 """
 
-import heapq
-import itertools
 
 log_filesutil = logging.getLogger("shds.filesutil")
 
@@ -2118,8 +2244,6 @@ Logs go to a per-user, always-writable location instead of beside the
 application package, so a protected install directory cannot block startup.
 """
 
-import logging.handlers
-import tempfile
 
 APP_NAME = "SmartHardwareDiagnosticScanner"
 
@@ -2179,6 +2303,9 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
     if logger.handlers:
         return logger
     logger.setLevel(level)
+    # Stop propagation before any record is emitted: a root handler from an
+    # embedding host must not echo these records as duplicates.
+    logger.propagate = False
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     file_handler: logging.Handler | None = None
@@ -2199,7 +2326,6 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
     console.setLevel(logging.WARNING)
     console.setFormatter(fmt)
     logger.addHandler(console)
-    logger.propagate = False
 
     if file_handler is None:
         logger.warning("File logging disabled — log file could not be created.")
@@ -2207,13 +2333,6 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
 
 
 """Modular diagnostic engine with documented, configurable thresholds."""
-
-import platform
-import re
-import subprocess
-import time
-from dataclasses import dataclass, field
-from datetime import datetime
 
 
 # Documented defaults: high usage => WARNING (not "damaged hardware").
@@ -2229,6 +2348,19 @@ DEFAULT_THRESHOLDS = {
     "gpu_temp_warn": 83.0,
     "gpu_temp_fail": 95.0,
 }
+
+
+def _th(th: dict, key: str) -> float:
+    """Threshold lookup that survives partial or malformed threshold dicts.
+
+    A diagnostics run must never crash on a caller-supplied threshold dict
+    that is missing a key or holds a non-numeric value; the documented
+    default is used instead.
+    """
+    try:
+        return float(th[key])
+    except (KeyError, TypeError, ValueError):
+        return float(DEFAULT_THRESHOLDS.get(key, 100.0))
 
 
 @dataclass
@@ -2257,6 +2389,8 @@ class DiagnosticReport:
 def _status_for(value: float | None, warn: float, fail: float) -> str:
     if value is None:
         return "UNAVAILABLE"
+    if warn > fail:  # defensive: inverted thresholds must not flip severity
+        warn, fail = fail, warn
     if value >= fail:
         return "FAIL"
     if value >= warn:
@@ -2316,7 +2450,7 @@ def diagnose_cpu(snap: HardwareSnapshot, th: dict) -> list[Finding]:
                         "CPU metrics unavailable.",
                         cpu.error or "psutil missing or access denied.",
                         key="CPU", code="CPU_UNAVAILABLE")]
-    st = _status_for(cpu.percent, th["cpu_warn"], th["cpu_fail"])
+    st = _status_for(cpu.percent, _th(th, "cpu_warn"), _th(th, "cpu_fail"))
     cores = f"{cpu.physical_cores}P/{cpu.logical_cores}L" if cpu.logical_cores else "n/a"
     msg = f"CPU utilisation {cpu.percent:.1f}% (cores {cores})"
     if st == "PASS":
@@ -2336,7 +2470,7 @@ def diagnose_memory(snap: HardwareSnapshot, th: dict) -> list[Finding]:
                         "Memory metrics unavailable.",
                         mem.error or "psutil missing.", key="Memory",
                         code="MEM_UNAVAILABLE")]
-    st = _status_for(mem.percent, th["mem_warn"], th["mem_fail"])
+    st = _status_for(mem.percent, _th(th, "mem_warn"), _th(th, "mem_fail"))
     msg = (f"Memory {mem.percent:.1f}% used "
            f"({format_bytes(mem.used)} / {format_bytes(mem.total)})")
     if st == "WARNING":
@@ -2363,11 +2497,11 @@ def diagnose_disks(snap: HardwareSnapshot, th: dict) -> list[Finding]:
                                key=f"Storage:{d.mountpoint or d.device}",
                                code="STORAGE_UNAVAILABLE"))
             continue
-        st = _status_for(d.percent, th["disk_warn"], th["disk_fail"])
+        st = _status_for(d.percent, _th(th, "disk_warn"), _th(th, "disk_fail"))
         code = "DISK_FULL" if st == "FAIL" else ("DISK_LOW" if st == "WARNING" else "")
         out.append(Finding("Storage", st,
                            f"{d.mountpoint} {d.percent:.1f}% used ({d.fstype or 'fs'})",
-                           f"total={d.total} used={d.used}",
+                           f"total={format_bytes(d.total)} used={format_bytes(d.used)}",
                            key=f"Storage:{d.mountpoint}", code=code))
     return out
 
@@ -2381,8 +2515,8 @@ def diagnose_gpu(snap: HardwareSnapshot, th: dict) -> list[Finding]:
     out: list[Finding] = []
     for gpu in g.gpus:
         key = f"GPU:{gpu.index}"
-        if gpu.temperature_c is not None:
-            st = _status_for(gpu.temperature_c, th["gpu_temp_warn"], th["gpu_temp_fail"])
+        if _plausible_temp(gpu.temperature_c):
+            st = _status_for(gpu.temperature_c, _th(th, "gpu_temp_warn"), _th(th, "gpu_temp_fail"))
             out.append(Finding("GPU", st,
                                f"GPU{gpu.index} {gpu.name}: {gpu.temperature_c:.0f}C" +
                                (f", util {gpu.utilization_pct:.0f}%" if gpu.utilization_pct is not None else ""),
@@ -2412,15 +2546,24 @@ def diagnose_network(snap: HardwareSnapshot, th: dict) -> list[Finding]:  # noqa
                     key="Network")]
 
 
+def _plausible_temp(value: object) -> bool:
+    """True for a finite numeric temperature (NaN/inf/junk are not real)."""
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def diagnose_temps(snap: HardwareSnapshot, th: dict) -> list[Finding]:
-    real = [t for t in snap.temps if t.status == "available" and t.current is not None]
+    real = [t for t in snap.temps
+            if t.status == "available" and _plausible_temp(t.current)]
     if not real:
         return [Finding("Sensors", "UNAVAILABLE",
                         "No reliable temperature sensors exposed on this machine.",
                         "Unsupported sensors are reported, never invented.")]
     out: list[Finding] = []
     for t in real[:8]:
-        st = _status_for(t.current, th["temp_warn"], th["temp_fail"])
+        st = _status_for(t.current, _th(th, "temp_warn"), _th(th, "temp_fail"))
         out.append(Finding("Sensors", st, f"{t.label}: {t.current:.1f}C (source: {t.source})",
                            key=f"Sensors:{t.label}"))
     return out
@@ -2514,11 +2657,16 @@ def diagnose_windows_os() -> list[Finding]:
                 "OS: Windows Update", "PASS",
                 "Windows Update service (wuauserv) is running.",
                 key="OS:WindowsUpdate"))
-        elif status in ("stopped", "stop pending", "start pending"):
+        elif status in ("stopped", "stoppending", "stop pending",
+                        "startpending", "start pending"):
+            # PowerShell prints the .NET enum names ("StartPending"/
+            # "StopPending") as a single word, so both spellings must be
+            # accepted: a service stuck mid-start or mid-stop is a
+            # recoverable WARNING, not an unreadable UNAVAILABLE.
             out.append(Finding(
                 "OS: Windows Update", "WARNING",
-                "Windows Update service (wuauserv) is stopped — updates may not "
-                "install until it starts.",
+                "Windows Update service (wuauserv) is not running "
+                f"(status: {status}).",
                 "Windows can start this service on demand; open Windows Update "
                 "and choose 'Check for updates'.",
                 key="OS:WindowsUpdate", code="WINDOWS_UPDATE_STOPPED"))
@@ -2698,12 +2846,20 @@ def diagnose_linux_os() -> list[Finding]:
 
 
 def _macos_log_errors(text: str, sample_limit: int = 3) -> tuple[int, list[str]]:
-    """Count non-header lines from ``log show``; keep a few samples."""
+    """Count real event lines from ``log show``; keep a few samples.
+
+    ``log show`` always prints a "Filtering the log data using …" banner for
+    predicate queries, before the "Timestamp" header row; both are banner
+    output, not events, so neither may be counted as an error line (counting
+    them would report ≥1 error even when the log is healthy).
+    """
     count = 0
     samples: list[str] = []
     for raw in (text or "").splitlines():
         line = raw.strip()
-        if not line or line.startswith("Timestamp"):
+        low = line.lower()
+        if (not line or low.startswith("timestamp")
+                or low.startswith("filtering the log data")):
             continue
         count += 1
         if len(samples) < sample_limit:
@@ -2793,20 +2949,24 @@ def diagnose_macos_os() -> list[Finding]:
 
 def diagnose_os(system: str | None = None) -> list[Finding]:
     """Run the read-only checks for the current (or given) operating system."""
-    system = system or platform.system()
+    # Normalise the requested platform ("windows", "win", "macos", "darwin",
+    # … all normalise like the explainer's _platform_name does), so callers
+    # passing a non-exact system string get the matching checks instead of
+    # an "unsupported" finding for the platform they are actually on.
+    name = _platform_name(system) if system else platform.system()
     try:
-        if system == "Windows":
+        if name == "Windows":
             return diagnose_windows_os()
-        if system == "Linux":
+        if name == "Linux":
             return diagnose_linux_os()
-        if system == "Darwin":
+        if name == "Darwin":
             return diagnose_macos_os()
     except Exception as exc:  # noqa: BLE001 - an OS check must never break a scan
         return [Finding("OS", "UNAVAILABLE", "OS-level health checks failed.",
                         str(exc), key="OS", code="OS_CHECK_ERROR")]
     return [Finding(
         "OS", "UNAVAILABLE",
-        f"No OS-level checks are implemented for {system or 'this system'}.",
+        f"No OS-level checks are implemented for {name or 'this system'}.",
         "Hardware checks still run normally.", key="OS",
         code="OS_UNSUPPORTED")]
 
@@ -2985,8 +3145,6 @@ may do:
 Matching is code-first (``Finding.code`` from the diagnostics engine) and then
 pattern-based, so older or third-party findings still get a useful answer.
 """
-
-from typing import Callable
 
 EXPLAINED_STATUSES = ("FAIL", "WARNING")
 
@@ -3189,18 +3347,42 @@ def _gpu_hot(_system: str = "") -> Explanation:
         "info")
 
 
-def _access_denied(system: str = "") -> Explanation:
-    admin = "Administrator" if _platform_name(system) == "Windows" else "elevated rights"
+def _sensor_hot(_system: str = "") -> Explanation:
     return Explanation(
-        "Administrator rights needed",
-        "The operating system protects this reading (sensor, system setting or "
-        "service list) behind elevated rights. The scanner reports it as "
+        "Temperature is high",
+        "A hardware temperature sensor reports a component running above its "
+        "threshold. Heat usually comes from a heavy workload, blocked vents or "
+        "a slow or failing fan; when the machine runs hot it throttles itself "
+        "to cool down, so everything slows.",
+        "Close the heaviest apps, make sure the vents and fans are clear of "
+        "dust and nothing blocks the airflow, then re-check. Seek service if "
+        "the reading stays high even with a light load. The scanner changes "
+        "nothing.",
+        "info")
+
+
+def _access_denied(system: str = "") -> Explanation:
+    if _platform_name(system) == "Windows":
+        return Explanation(
+            "Administrator rights needed",
+            "The operating system protects this reading (sensor, system "
+            "setting or service list) behind elevated rights. The scanner "
+            "reports it as unavailable instead of inventing a value — 'Access "
+            "Denied' is a permission wall, not a hardware fault.",
+            "If you trust this app, re-run it with Administrator ('Run as "
+            "administrator' on Windows, sudo on Linux/macOS) to read that "
+            "sensor. Otherwise treat the value as unknown. The scanner never "
+            "elevates itself.",
+            "info")
+    return Explanation(
+        "Elevated rights needed",
+        "The operating system protects this reading (sensor, system setting "
+        "or service list) behind elevated rights. The scanner reports it as "
         "unavailable instead of inventing a value — 'Access Denied' is a "
         "permission wall, not a hardware fault.",
-        f"If you trust this app, re-run it with {admin} ('Run as "
-        "administrator' on Windows, sudo on Linux/macOS) to read that sensor. "
-        "Otherwise treat the value as unknown. The scanner never elevates "
-        "itself.",
+        "If you trust this app, re-run it with elevated rights (sudo on "
+        "Linux/macOS) to read that sensor. Otherwise treat the value as "
+        "unknown. The scanner never elevates itself.",
         "info")
 
 
@@ -3238,11 +3420,6 @@ _CODE_BUILDERS: dict[str, Callable[[str], Explanation]] = {
 }
 
 
-def known_codes() -> frozenset[str]:
-    """Codes that have a dedicated explanation (used by tests and docs)."""
-    return frozenset(_CODE_BUILDERS)
-
-
 def _from_patterns(text: str, system: str) -> Explanation | None:
     """Fallback for findings without a known code (or from older exports)."""
     if any(marker in text for marker in (
@@ -3265,6 +3442,12 @@ def _from_patterns(text: str, system: str) -> Explanation | None:
         return _systemd(system)
     if "time machine" in text or "timemachine" in text or "tmutil" in text:
         return _time_machine(system)
+    # Sensor/temperature findings ("CPU pkg: 92.0C (source: ...)") carry no
+    # code and describe heat, not load; they must not fall through to the
+    # cpu/memory/gpu keyword checks below, which would explain a hot sensor
+    # as "High CPU load".
+    if ("(source: " in text or "temperature" in text or "sensors" in text):
+        return _sensor_hot(system)
     if ("storage" in text or "disk" in text or "volume" in text
             or "partition" in text):
         return _explain_disk(system)
@@ -3324,18 +3507,8 @@ two minutes". It is deliberately powerful, and just as deliberately fenced:
   Diagnostics output shows exactly what happened.
 """
 
-import logging
-import os
-import threading
 
 log_actions = logging.getLogger("shds.actions")
-
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:  # pragma: no cover - psutil is a core dependency in practice
-    psutil = None  # type: ignore
-    HAS_PSUTIL = False
 
 # Metrics a rule can watch. All are percentages (0..100).
 METRIC_LABELS = {"cpu": "CPU", "mem": "RAM", "disk": "Disk"}
@@ -3377,14 +3550,14 @@ _HARD_PROTECTED_FLOOR = frozenset({
 # Lowest PID value that may be terminated (0/4 are kernel on Windows).
 _MIN_KILLABLE_PID = 5
 
-METRIC_ATTRS = {"cpu": "cpu", "mem": "mem", "disk": "disks"}
-
 
 def is_protected_process(name: str | None) -> bool:
     """True when a process must never be terminated."""
-    if not name:
+    if not name or not isinstance(name, str):
+        # A name the caller cannot describe as a string is data corruption:
+        # refuse rather than guess (the skip is the safe direction).
         return True
-    base = str(name).strip().lower()
+    base = name.strip().lower()
     base = base[:-4] if base.endswith(".exe") else base
     base = base.strip()
     return ((not base) or base in _HARD_PROTECTED_FLOOR
@@ -3496,6 +3669,13 @@ class RuleEngine:
         # kill_process victim source: callable(sort_by) -> rows with
         # .pid/.name/.cpu/.mem_mb. None falls back to psutil via collect_processes.
         self._proc_provider = proc_provider
+        # Victim selection + termination is serialized engine-wide. A rule's
+        # own double fires are guarded by ActionRule.in_flight, but two
+        # DIFFERENT kill rules can fire on the same tick; without this lock
+        # both would sort the same (possibly stale) process list and could
+        # terminate the same process twice (or race a PID that another rule
+        # victims out after a refresh).
+        self._kill_lock = threading.Lock()
 
     # ---------- logging helpers ----------
     def _log(self, message: str, tag: str = "AUTO") -> None:
@@ -3581,21 +3761,44 @@ class RuleEngine:
         Sorting follows the watched metric (CPU breach → sort by CPU,
         RAM breach → sort by memory; a Disk breach has no sensible victim and
         falls back to CPU). Protected and system processes are skipped.
+
+        The candidate list may be stale (monitor tick seconds ago), so before
+        terminating, the victim's identity is re-validated against the LIVE
+        process: a vanished PID is skipped and a PID whose current name is
+        protected (it may have been reused by Windows since the snapshot) is
+        never touched.
         """
         if not HAS_PSUTIL:
             return ("psutil is unavailable, so the kill_process action ran "
                     "with no one to safely terminate.", "WARNING")
         sort_by = "mem" if rule.metric == "mem" else "cpu"
+        # Only one victim may ever be selected and terminated at a time: two
+        # kill rules firing on the same tick must not both act on the same
+        # top-of-list candidate (see self._kill_lock).
+        with self._kill_lock:
+            return self._kill_candidates(rule, sort_by)
+
+    def _kill_candidates(self, rule: ActionRule, sort_by: str) -> tuple[str, str]:
+        """Pick and terminate one victim; call with _kill_lock held."""
         rows = self._victims(sort_by)
         for row in rows:
-            pid = getattr(row, "pid", 0)
-            name = getattr(row, "name", "")
-            if pid < _MIN_KILLABLE_PID or pid == self.self_pid:
+            pid = _safe_int(getattr(row, "pid", 0))
+            if pid is None or pid < _MIN_KILLABLE_PID or pid == self.self_pid:
                 continue
+            name = getattr(row, "name", "")
             if is_protected_process(name):
                 continue
+            # Re-verify against the live process before acting on the stale
+            # snapshot row: PIDs get reused within seconds on Windows.
             try:
-                psutil.Process(int(pid)).terminate()
+                proc = psutil.Process(pid)
+                live_name = proc.name()
+            except Exception:  # noqa: BLE001 - vanished/unqueryable: try next
+                continue
+            if is_protected_process(live_name):
+                continue
+            try:
+                proc.terminate()
             except Exception as exc:  # noqa: BLE001 - a refused kill is logged
                 return (f"Auto-action tried to kill {name} (PID {pid}) but the "
                         f"system refused: {exc}", "WARNING")
@@ -3633,12 +3836,6 @@ class RuleEngine:
 
 
 """Diagnostic report building + JSON/TXT/CSV export with safe file handling."""
-
-import csv
-import html
-import json
-from dataclasses import asdict
-from pathlib import Path
 
 
 log_reports = logging.getLogger("shds.reports")
@@ -3763,7 +3960,6 @@ def render_html(payload: dict) -> str:
     ts = str(payload.get("timestamp", ""))
     host = str(payload.get("hostname", ""))
     summary = payload.get("summary", {}) or {}
-    hw = payload.get("hardware", {}) or {}
 
     cards: list[tuple[str, str]] = [
         ("Host", host),
@@ -3922,7 +4118,7 @@ def render_comparison_html(comparison: dict,
 <div class="sub">Host {esc(host)} · previous scan {esc(prev_ts)} · current scan {esc(cur_ts)}</div>
 <div class="grid">
   <div class="kv"><div class="k">Health score before</div><div class="v">{esc(prev_score_html)}</div></div>
-  <div class="kv"><div class="k">Health score now</div><div class="v"><span class="b-INFO">{cur_score_html}</span></div></div>
+  <div class="kv"><div class="k">Health score now</div><div class="v"><span class="b-INFO">{esc(cur_score_html)}</span></div></div>
   <div class="kv"><div class="k">Changed checks</div><div class="v">{total_changes}</div></div>
 </div>
 {"".join(sections)}
@@ -3945,11 +4141,6 @@ def render_comparison_html(comparison: dict,
 
 """Optional update check against GitHub releases (metadata only, never auto-installs)."""
 
-import http.client
-import socket
-import urllib.error
-import urllib.parse
-import urllib.request
 
 log_updater = logging.getLogger("shds.updater")
 
@@ -3975,12 +4166,31 @@ def _unavailable(detail: str) -> UpdateCheck:
 
 
 def parse_tag(tag: str | None) -> str:
-    """Strip a leading "v"/"V" and whitespace; non-string input yields ""."""
+    """Normalize a release tag into a dotted-numeric core version.
+
+    Strips a leading "v"/"V" and whitespace, then cuts off pre-release /
+    build metadata ("v1.2.1-rc1" -> "1.2.1", "1.2.1+build.2" -> "1.2.1").
+    The cut only happens when the remaining core is still dotted-numeric —
+    a tag like "release-1.3.0" is left alone (compare_versions already
+    treats non-numeric input as undecidable, and mangling it to "release"
+    would lose information). Without the suffix strip, pre-release tags made
+    the numeric comparison undecidable and genuine updates read as
+    "up to date". Non-string input yields "".
+    """
     if not isinstance(tag, str):
         return ""
     text = tag.strip()
     if text[:1] in ("v", "V"):
         text = text[1:]
+    cut = len(text)
+    for sep in ("-", "+"):
+        pos = text.find(sep)
+        if pos != -1:
+            cut = min(cut, pos)
+    if cut < len(text):
+        core = text[:cut]
+        if core and core.replace(".", "").isdigit():
+            return core
     return text
 
 
@@ -4049,7 +4259,10 @@ def check_for_update(url: str | None = None, timeout: float = 4.0) -> UpdateChec
     if not latest:
         return _unavailable("GitHub response contained no usable tag_name.")
     result = UpdateCheck(latest=latest)
-    order = compare_versions(APP_VERSION, latest)
+    # Compare dotted-numeric cores on both sides: a locally running
+    # pre-release string ("1.2.9-beta") would otherwise be undecidable and
+    # could mask a newer release.
+    order = compare_versions(parse_tag(APP_VERSION), latest)
     if order < 0:
         result.status = "update_available"
         result.detail = f"update available: {latest} (current {APP_VERSION})."
@@ -4068,7 +4281,6 @@ No I/O happens here and no subprocess is ever started by this module: the GUI
 composes the argv/lines with these helpers and owns running (and removing) them.
 """
 
-import shlex
 
 log_scheduler = logging.getLogger("shds.scheduler")
 
@@ -4168,11 +4380,14 @@ def build_cron_line(python_exe: str, script: str, day: str = "MON", when: str = 
 def strip_scheduled_entries(text: str) -> tuple[str, int]:
     """Remove every line containing SCHEDULE_MARKER; return (cleaned_text, removed_count).
 
-    All other lines are preserved as-is (line ending style included); trailing
-    blank lines left behind by removals are collapsed.
+    All other lines are preserved as-is (line ending style included). The
+    empty string that `split` emits after a final newline is a terminator,
+    not a blank line, so a file's trailing ">" is never consumed by the
+    cleanup of blank lines left behind where marker lines were removed.
     """
     if not isinstance(text, str):
         return "", 0
+    had_terminal_newline = text.endswith("\n")
     kept: list[str] = []
     removed = 0
     for line in text.split("\n"):
@@ -4183,6 +4398,8 @@ def strip_scheduled_entries(text: str) -> tuple[str, int]:
     if removed:
         while kept and not kept[-1].strip():
             kept.pop()
+        if had_terminal_newline:
+            kept.append("")  # restore the file terminator eaten by the split
     return "\n".join(kept), removed
 
 
@@ -4218,12 +4435,6 @@ Design grid: every painter works on a 24x24 grid (`u` = one grid unit in
 real pixels); strokes are `lw` = `STROKE_UNITS` grid units wide, matching
 the look of standard 2px icon strokes.
 """
-
-import math
-
-from PIL import Image, ImageDraw
-
-import customtkinter as ctk
 
 
 __all__ = ["ICON_NAMES", "get_icon", "clear_cache"]
@@ -4272,13 +4483,6 @@ def _security(d, u, lw, color):
     pts = [(12 * u, 3 * u), (19.5 * u, 6 * u), (18.5 * u, 13 * u),
            (12 * u, 21 * u), (5.5 * u, 13 * u), (4.5 * u, 6 * u)]
     d.line(pts + [pts[0]], fill=color, width=lw, joint="curve")
-
-
-def _speed(d, u, lw, color):
-    """Lightning bolt (speed / performance), filled."""
-    pts = [(13.5 * u, 2 * u), (5.5 * u, 13.5 * u), (10.5 * u, 13.5 * u),
-           (9.5 * u, 22 * u), (18.5 * u, 9.5 * u), (13 * u, 9.5 * u)]
-    d.polygon(pts, fill=color)
 
 
 def _settings(d, u, lw, color):
@@ -4390,14 +4594,6 @@ def _network(d, u, lw, color):
     d.ellipse([12 * u - r, 18 * u - r, 12 * u + r, 18 * u + r], fill=color)
 
 
-def _health(d, u, lw, color):
-    """Heart (system health)."""
-    pts = [(12 * u, 20.5 * u), (4.5 * u, 13 * u), (4.5 * u, 8 * u),
-           (8.2 * u, 4.5 * u), (12 * u, 7.5 * u), (15.8 * u, 4.5 * u),
-           (19.5 * u, 8 * u), (19.5 * u, 13 * u)]
-    d.polygon(pts, fill=color)
-
-
 def _refresh(d, u, lw, color):
     """Sync arrows (refresh / reload)."""
     d.arc([4.5 * u, 4.5 * u, 19.5 * u, 19.5 * u], start=30, end=270,
@@ -4410,7 +4606,6 @@ _PAINTERS = {
     "monitor": _monitor,
     "dashboard": _dashboard,
     "security": _security,
-    "speed": _speed,
     "settings": _settings,
     "processes": _processes,
     "connections": _connections,
@@ -4423,7 +4618,6 @@ _PAINTERS = {
     "gpu": _gpu,
     "disk": _disk,
     "network": _network,
-    "health": _health,
     "refresh": _refresh,
 }
 
@@ -4439,16 +4633,6 @@ NAV_ICONS = {
     "Diagnostics": "diagnostics",
     "Reports & Tools": "reports",
 }
-
-# Dashboard metric cards: card title -> icon name.
-CARD_ICONS = {
-    "CPU": "cpu",
-    "RAM": "ram",
-    "GPU": "gpu",
-    "Disk": "disk",
-    "Network": "network",
-}
-
 
 def get_icon(name: str, size: int = 24, color: str | None = None) -> "ctk.CTkImage":
     """Render one vector icon as a `customtkinter.CTkImage`.
@@ -4489,7 +4673,6 @@ def clear_cache() -> None:
     _BITMAP_CACHE.clear()
 """Optional Matplotlib live charts, embedded in Tkinter (degrades gracefully)."""
 
-import logging
 
 log_charts = logging.getLogger("shds.charts")
 
@@ -4557,11 +4740,6 @@ class ChartPanel:
         except Exception as exc:
             log_charts.debug("chart update failed: %s", exc)
 
-    def pack_widget(self) -> None:
-        if self.canvas is None:
-            return
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-
     def set_palette(self, bg: str, fg: str, border: str,
                     cpu_colour: str, mem_colour: str) -> None:
         """Re-colour the chart for a theme switch (no-op without Matplotlib)."""
@@ -4606,15 +4784,14 @@ This module holds the small compatibility layer that the migration needs:
   wrong fill.
 * `start(interval)` / `stop()` accept the ttk `Progressbar.start(interval)`
   signature (CTk ignores the interval; speed is fixed by CTk).
-* `apply_button_state` / `apply_entry_state` replace the ttk
-  `widget.state(["disabled"])` idiom, which CustomTkinter does not provide.
+* `apply_button_state` replaces the ttk `widget.state(["disabled"])` idiom,
+  which CustomTkinter does not provide.
 """
-
 
 
 __all__ = ["ProgressBar", "make_button", "make_side_button", "make_entry",
            "make_switch", "make_menu", "make_progress", "make_card",
-           "apply_button_state", "apply_entry_state"]
+           "apply_button_state"]
 
 # The factories live in theme.py (they read the palette); re-exported here so
 # UI code builds every themed CustomTkinter widget through one façade.
@@ -4703,11 +4880,6 @@ def apply_button_state(widget, state: str) -> None:
     widget.configure(state="disabled" if state == "disabled" else "normal")
 
 
-def apply_entry_state(widget, state: str) -> None:
-    """Enable/disable a CTkEntry (same replacement as `apply_button_state`)."""
-    widget.configure(state="disabled" if state == "disabled" else "normal")
-
-
 def make_progress(master, bg_color: str | None = None, **kwargs):
     """Create a themed progress bar that can be re-coloured on a theme switch.
 
@@ -4721,11 +4893,6 @@ def make_progress(master, bg_color: str | None = None, **kwargs):
     setattr(bar, T._THEME_TAG, ("progress", None, bg_color))
     return bar
 """Background monitoring worker: samples hardware on a thread, GUI polls a queue."""
-
-import queue
-import threading
-import time
-from dataclasses import dataclass, field
 
 
 log_monitoring = logging.getLogger("shds.monitoring")
@@ -4841,64 +5008,8 @@ class MonitorWorker:
             pass
         return items
 
-    def clear_history(self) -> None:
-        self.history.clear()
 
-
-@dataclass
-class ScanWorker:
-    """One-shot diagnostic scan on a background thread with result queue."""
-
-    result: queue.Queue = field(default_factory=queue.Queue)
-    _stop: threading.Event = field(default_factory=threading.Event)
-    running: bool = False
-
-    def start(self, snapshot: HardwareSnapshot, thresholds: dict | None = None) -> bool:
-        if self.running:
-            return False
-
-        self._stop.clear()
-        self.running = True
-
-        def _job() -> None:
-            try:
-                # Simulate staged progress so the GUI progress bar animates.
-                for _ in range(4):
-                    if self._stop.is_set():
-                        break
-                    time.sleep(0.15)
-                if not self._stop.is_set():
-                    self.result.put(run_diagnostics(snapshot, thresholds))
-            except Exception as exc:
-                log_monitoring.exception("scan failed: %s", exc)
-                self.result.put(exc)
-            finally:
-                self.running = False
-
-        try:
-            threading.Thread(target=_job, name="shds-scan", daemon=True).start()
-        except (RuntimeError, OSError) as exc:
-            # Never leave `running` stuck True: the scan button would stay
-            # disabled for the rest of the session.
-            log_monitoring.warning("scan thread failed to start: %s", exc)
-            self.running = False
-            return False
-        return True
-
-    def cancel(self) -> None:
-        self._stop.set()
 """Dark Neon desktop GUI (CustomTkinter). All widget updates run on the main thread."""
-
-import os
-import platform
-import subprocess
-import sys
-import tempfile
-from datetime import datetime
-from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-
 
 
 log_app = configure_logging()
@@ -5453,12 +5564,15 @@ class ScannerApp(ctk.CTk):
             ("Metric (watched)", ctkw.make_menu(
                 add_box, T.BG_PANEL, values=list(METRIC_LABELS.values()),
                 variable=self.rule_metric_var, width=90)),
+            # CTkEntry's width is in PIXELS (the ttk Entry it replaces took
+            # characters), so the old character counts collapsed these inputs
+            # to a ~22 px sliver that displays no readable text.
             ("Threshold (%)", ctkw.make_entry(add_box, T.BG_PANEL,
                                               textvariable=self.rule_threshold_var,
-                                              width=10)),
+                                              width=64)),
             ("Duration (s)", ctkw.make_entry(add_box, T.BG_PANEL,
                                              textvariable=self.rule_duration_var,
-                                             width=10)),
+                                             width=64)),
             ("Action (when fired)", ctkw.make_menu(
                 add_box, T.BG_PANEL, values=list(ACTION_LABELS.values()),
                 variable=self.rule_action_var, width=170)),
@@ -5628,6 +5742,10 @@ class ScannerApp(ctk.CTk):
         self.diag_text = tk.Text(out_box, bg=T.BG_OUTPUT, fg=T.OUTPUT_FG,
                                  insertbackground=T.NEON_CYAN, font=T.FONT_MONO,
                                  wrap="word", state="disabled")
+        # Exact palette roles, so retheming never has to guess them back.
+        self.diag_text._palette_opts = {"bg": "BG_OUTPUT",
+                                        "foreground": "OUTPUT_FG",
+                                        "insertbackground": "NEON_CYAN"}
         sb = ttk.Scrollbar(out_box, orient="vertical", command=self.diag_text.yview)
         self.diag_text.configure(yscrollcommand=sb.set)
         self.diag_text.pack(side="left", fill="both", expand=True, padx=2, pady=2)
@@ -5768,7 +5886,10 @@ class ScannerApp(ctk.CTk):
                      font=T.FONT_SMALL).grid(row=i // 4, column=(i % 4) * 2,
                                              sticky="w", padx=4, pady=2)
             var = tk.StringVar(value=str(val))
-            ent = ctkw.make_entry(th_box, T.BG_PANEL, textvariable=var, width=8)
+            # CTkEntry's width is in PIXELS: the ttk `width=8` (characters)
+            # this input carried over from the migration renders as a
+            # ~22 px sliver — wide enough to hold one digit, not a threshold.
+            ent = ctkw.make_entry(th_box, T.BG_PANEL, textvariable=var, width=56)
             ent.grid(row=i // 4, column=(i % 4) * 2 + 1, padx=4, pady=2, sticky="w")
             self.th_vars[key] = var
         ctkw.make_button(th_box, "ghost", T.BG_PANEL, text="Apply thresholds",
@@ -5791,6 +5912,9 @@ class ScannerApp(ctk.CTk):
                                   fg=T.FG_PRIMARY, font=T.FONT_MONO, wrap="word",
                                   insertbackground=T.NEON_CYAN,
                                   state="disabled")
+        self.clean_list._palette_opts = {"bg": "BG_OUTPUT",
+                                         "foreground": "FG_PRIMARY",
+                                         "insertbackground": "NEON_CYAN"}
         self.clean_list.pack(fill="both", expand=True)
         self._previewed: list[Path] = []
 
@@ -5816,6 +5940,9 @@ class ScannerApp(ctk.CTk):
                                      fg=T.FG_PRIMARY, font=T.FONT_MONO,
                                      insertbackground=T.NEON_CYAN,
                                      wrap="word", state="disabled")
+        self.bigfiles_list._palette_opts = {"bg": "BG_OUTPUT",
+                                            "foreground": "FG_PRIMARY",
+                                            "insertbackground": "NEON_CYAN"}
         self.bigfiles_list.pack(fill="both", expand=True)
 
         sched_box = tk.LabelFrame(
@@ -5839,8 +5966,10 @@ class ScannerApp(ctk.CTk):
         tk.Label(srow, text="Time (HH:MM):", bg=T.BG_PANEL, fg=T.FG_MUTED,
                  font=T.FONT_SMALL).pack(side="left")
         self.schedule_time_var = tk.StringVar(value="09:00")
+        # CTkEntry's width is in PIXELS: 52 px keeps the HH:MM input usable
+        # (the ttk character width from the migration rendered a ~22 px sliver).
         ctkw.make_entry(srow, T.BG_PANEL, textvariable=self.schedule_time_var,
-                        width=7).pack(side="left", padx=(4, 12))
+                        width=52).pack(side="left", padx=(4, 12))
         ctkw.make_button(srow, "ghost", T.BG_PANEL, text="Register weekly scan",
                          command=self.register_schedule).pack(side="left",
                                                               padx=(0, 8))
@@ -5963,6 +6092,19 @@ class ScannerApp(ctk.CTk):
                 continue
             if cls not in self._THEME_SWAP_CLASSES:
                 continue  # ttk widgets follow the rebuilt styles
+            recorded = getattr(widget, "_palette_opts", None)
+            if recorded:
+                # Construction recorded which palette keys paint this widget:
+                # apply them directly rather than round-tripping through the
+                # colour-to-colour swap map, which is ambiguous when two
+                # palette keys share one light-mode colour (e.g. OUTPUT_FG
+                # and FG_PRIMARY) and first-wins picks the wrong counterpart.
+                try:
+                    widget.configure({option: getattr(T, key)
+                                      for option, key in recorded.items()})
+                except (tk.TclError, AttributeError):  # noqa: BLE001 - stale key
+                    pass
+                continue
             for option in ("bg", "foreground", "highlightbackground",
                            "insertbackground"):
                 try:
@@ -6294,7 +6436,10 @@ class ScannerApp(ctk.CTk):
     def _apply_diag(self, diag: DiagnosticReport, payload: dict) -> None:
         # Compare against the previous scan *before* overwriting it.
         had_previous = self.previous_diag is not None
-        self.last_comparison = compare_reports(self.previous_diag, diag)
+        # compare_reports() walks two Finding lists; pass the reports' findings.
+        self.last_comparison = compare_reports(
+            self.previous_diag.findings if had_previous else None,
+            diag.findings)
         self.previous_diag = diag
         self.previous_payload = self.latest_payload
         self.latest_diag = diag
@@ -6488,9 +6633,17 @@ class ScannerApp(ctk.CTk):
                          name="shds-schedule", daemon=True).start()
 
     def _package_entry_script(self) -> str:
-        """Runnable entry point for the scheduled scan: <project>/main.py."""
-        package_dir = Path(__file__).resolve().parent.parent
-        return str(package_dir / "main.py")
+        """Runnable script the scheduled scan must execute headlessly.
+
+        Package layout: <project>/main.py sits beside the scanner package.
+        The standalone build is its own entry point: pointing the weekly
+        task at the parent directory's main.py would register a path that
+        does not exist next to the standalone file, so every scheduled run
+        would fail before the scan even starts.
+        """
+        script = Path(__file__).resolve()
+        candidate = script.parent / "main.py"
+        return str(candidate if candidate.is_file() else script)
 
     def _schedule_job(self, day: str, when: str) -> None:
         """Runs off-thread; communicates the outcome via the background queue."""
@@ -6674,7 +6827,20 @@ class ScannerApp(ctk.CTk):
                 self._monitor_polling = True
                 self._reschedule(500, self._poll_monitor)
         else:
-            messagebox.showinfo("Monitoring", "Monitoring is already running.")
+            if self.monitor.running:
+                # The worker was armed by some other path without the button
+                # flag: the honest message.
+                messagebox.showinfo("Monitoring", "Monitoring is already running.")
+            else:
+                # start() also returns False when its thread could not be
+                # created (thread limit / interpreter shutdown): the old code
+                # claimed "already running", which is false and misleading.
+                messagebox.showerror(
+                    "Monitoring",
+                    "Monitoring could not be started: the background worker "
+                    "thread is unavailable.")
+                self.set_status("Monitoring unavailable: worker thread could "
+                                "not start.")
 
     def _poll_monitor(self) -> None:
         if not self.monitor_running:
@@ -6916,10 +7082,162 @@ class ScannerApp(ctk.CTk):
         except tk.TclError:
             pass
 
-def main() -> int:
-    app = ScannerApp()
-    app.mainloop()
-    return 0
+def _build_cli_parser():
+    """Command-line interface (headless scanning for Task Scheduler / CI)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="ewarecare.py",
+        description="Smart Hardware Diagnostic Scanner — Dark Neon Edition. "
+                    "Run without arguments to open the GUI, or use --scan for a "
+                    "headless scan (usable from Task Scheduler).",
+        epilog="Exit codes: 0 = no FAIL findings, 1 = at least one FAIL, "
+               "2 = the scan could not run.")
+    parser.add_argument("--scan", action="store_true",
+                        help="run one headless scan and exit (no GUI)")
+    parser.add_argument("--json", metavar="PATH",
+                        help="write a JSON report to PATH (with --scan)")
+    parser.add_argument("--txt", metavar="PATH",
+                        help="write a TXT report to PATH (with --scan)")
+    parser.add_argument("--csv", metavar="PATH",
+                        help="write a CSV report to PATH (with --scan)")
+    parser.add_argument("--html", metavar="PATH",
+                        help="write a self-contained HTML report to PATH "
+                             "(with --scan)")
+    parser.add_argument("--no-gpu", action="store_true",
+                        help="skip the GPU query (faster)")
+    parser.add_argument("--no-history", action="store_true",
+                        help="accepted for scheduler compatibility (the "
+                             "standalone build records no scan history)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="print only the summary (health score and "
+                             "counts), not the per-finding list")
+    return parser
+
+
+def _headless_scan(argv: list[str]) -> int:
+    """Headless scan behind `--scan`; never opens a Tk window.
+
+    This is what the app's own "Scheduled weekly scan" feature executes
+    (`scan_args()` passes `--scan --quiet --no-history`), so it must run in
+    a service context, print something useful, and return a real exit code.
+    Exit codes: 0 = no FAIL findings, 1 = at least one FAIL finding,
+    2 = the scan could not run.
+    """
+    args = _build_cli_parser().parse_args(argv)
+
+    # A cp1252 console (common on Windows) cannot encode characters used in
+    # findings; replace rather than crash the scheduled run. A --windowed
+    # (pythonw) run has no console at all: streams may be None.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    def emit(message: str = "") -> None:
+        if not args.quiet:
+            print(message)
+
+    def emit_always(message: str = "") -> None:
+        # The summary lines are the point of --quiet: a scheduled run must
+        # still report the health score and the finding counts.
+        print(message)
+
+    emit("Scanning hardware…")
+    try:
+        snap = collect_snapshot(include_gpu=not args.no_gpu)
+        diag = run_diagnostics(snap, dict(DEFAULT_THRESHOLDS))
+        payload = build_report_dict(snap, diag, dict(DEFAULT_THRESHOLDS))
+    except Exception as exc:
+        log_app.exception("headless scan failed")
+        print(f"Scan failed: {exc}", file=sys.stderr)
+        return 2
+
+    total = system_health_score(snap, diag.findings).get("total")
+    summary = diag.summary
+    if total is None:
+        emit_always("Health score: n/a (no live metrics were available)")
+    else:
+        emit_always(f"Health score: {total:.0f}/100")
+    emit_always(f"PASS={summary.get('PASS', 0)} "
+                f"WARNING={summary.get('WARNING', 0)} "
+                f"FAIL={summary.get('FAIL', 0)} "
+                f"UNAVAILABLE={summary.get('UNAVAILABLE', 0)}")
+    if not args.quiet:
+        emit("")
+        for f in diag.findings:
+            line = f"[{f.status}] {f.component}: {f.message}"
+            if f.detail:
+                line += f"  ({f.detail})"
+            emit(line)
+        if diag.recommendations:
+            emit("")
+            emit("Recommendations:")
+            for rec in diag.recommendations:
+                emit(f" - {rec}")
+
+    for fmt, dest in (("JSON", args.json), ("TXT", args.txt),
+                      ("CSV", args.csv), ("HTML", args.html)):
+        if not dest:
+            continue
+        try:
+            path = save_report(payload, dest)
+            emit_always(f"{fmt} report written: {path}")
+        except (ValueError, PermissionError, OSError) as exc:
+            print(f"Could not write {fmt} report: {exc}", file=sys.stderr)
+            return 2
+
+    return 1 if summary.get("FAIL", 0) else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """GUI by default; `--scan` switches to the headless CLI path.
+
+    Exit codes: GUI run 0 (1 on a fatal startup error); headless scan
+    0 = no FAIL, 1 = at least one FAIL, 2 = the scan could not run. The
+    weekly schedule this app registers launches it with
+    `--scan --quiet --no-history`, which must NOT open a GUI window that
+    never exits and never reports.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if any(a == "--scan" for a in argv):
+            return _headless_scan(argv)
+        if argv:
+            # Unknown args without --scan: report usage rather than silently
+            # opening the GUI and ignoring what the user asked for.
+            _build_cli_parser().parse_args(argv)
+            print("Nothing to do: pass --scan for a headless run, "
+                  "or run without arguments to open the GUI.")
+            return 0
+        try:
+            app = ScannerApp()
+        except Exception as exc:  # startup failure must not exit 0 silently
+            import traceback
+            log_app.exception("startup failed")
+            traceback.print_exc()
+            try:
+                messagebox.showerror(
+                    "Startup failed",
+                    f"Smart Hardware Diagnostic Scanner failed to start.\n\n"
+                    f"{exc}\n\nSee the log file for details.")
+            except Exception:
+                pass
+            return 1
+        app.mainloop()
+        return 0
+    except SystemExit as exc:  # argparse usage errors from the CLI paths
+        return int(exc.code or 0)
+    except Exception as exc:
+        import traceback
+        log_app.exception("fatal error: %s", exc)
+        traceback.print_exc()
+        try:
+            messagebox.showerror("Fatal error", f"Unexpected error:\n{exc}")
+        except Exception:
+            pass
+        return 1
 
 
 if __name__ == "__main__":

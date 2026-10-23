@@ -62,16 +62,6 @@ def _socket_kind(value) -> str:
         return str(value)
 
 
-def _addr_port(addr) -> int:
-    """The port part of a psutil address tuple (-1 when unusable)."""
-    if not addr or len(addr) < 2:
-        return -1
-    try:
-        return int(addr[1])
-    except (TypeError, ValueError):
-        return -1
-
-
 def _conn_row(c, names: dict[int, str]) -> ConnRow:
     """One ConnRow from a psutil connection entry (never signals)."""
     pid = int(getattr(c, "pid", 0) or 0)

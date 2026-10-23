@@ -12,7 +12,7 @@ Ground rules honoured here:
   invokes a method that pops one);
 * no network, no files written; one Tk root (the ScannerApp itself) per module;
 * tests assert CORRECT post-fix behaviour; known pre-fix failures map to the
-  numbered bugs in ``tests/audit_reports/agent2_ui_fixes.md``:
+  numbered bugs in the historical UI audit (Agent 2):
   - ``test_automation_labelframe_follows_theme``   -> Bug 1 (CRITICAL)
   - ``test_reports_labelframes_follow_theme``      -> Bug 1 (CRITICAL)
   - ``test_text_widget_caret_follows_theme``       -> Bug 2 (MEDIUM)

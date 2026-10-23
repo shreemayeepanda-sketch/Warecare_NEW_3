@@ -4,7 +4,7 @@ Target module: ``E:/Warecare/ewarecare.py`` (standalone flattened build).
 Scope: thread/queue plumbing races around ``MonitorWorker``, ``RuleEngine``
 (the kill switch), the ``ScannerApp`` background workers and the shutdown path.
 
-Bug map (evidence + fixes in tests/audit_reports/agent1_threading_fixes.md):
+Bug map (numbering from the historical threading audit, Agent 1):
 
 * Bug 1 (HIGH)    ``MonitorWorker._loop`` reads ``self._stop`` by attribute;
   ``start()`` swaps that event between runs, so an old sampler thread that is
@@ -47,8 +47,6 @@ import time
 import tkinter as tk
 from pathlib import Path
 from types import SimpleNamespace
-
-import pytest
 
 # --------------------------------------------------------------------------
 # Bootstrap: import the standalone module from its file path.

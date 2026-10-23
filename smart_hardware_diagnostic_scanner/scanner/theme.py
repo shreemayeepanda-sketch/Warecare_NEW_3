@@ -57,7 +57,6 @@ PALETTE_KEYS = (
 # active item gets a solid highlight. "transparent" is a valid CustomTkinter
 # colour (the widget then paints its parent's colour) but not a Tk colour, so
 # it lives only in the BTN_* widget keys.
-_SIDE_TRANSPARENT = "transparent"
 
 _DARK_PALETTE = {
     # Backgrounds. BG_CARD (#1C1C28) is shared by the widgets' ghost styling —

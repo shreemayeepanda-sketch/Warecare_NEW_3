@@ -1,10 +1,7 @@
 """Tests for hardware collection: calculations, missing sensors, error paths."""
 from __future__ import annotations
 
-import builtins
-import sys
 import threading
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 

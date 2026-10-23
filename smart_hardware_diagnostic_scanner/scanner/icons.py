@@ -20,8 +20,6 @@ the look of standard 2px icon strokes.
 """
 from __future__ import annotations
 
-import math
-
 from PIL import Image, ImageDraw
 
 import customtkinter as ctk
@@ -54,13 +52,6 @@ _BITMAP_CACHE: dict[tuple[str, int, str], "Image.Image"] = {}
 #   lw    — stroke width, in supersampled pixels (STROKE_UNITS * u)
 #   color — stroke / fill colour as a hex string
 # ---------------------------------------------------------------------------
-def _monitor(d, u, lw, color):
-    """A display screen (the requested 'monitor' circle, drawn as a dial)."""
-    d.ellipse([4 * u, 4 * u, 20 * u, 20 * u], outline=color, width=lw)
-    r = 1.6 * u
-    d.ellipse([12 * u - r, 12 * u - r, 12 * u + r, 12 * u + r], fill=color)
-
-
 def _dashboard(d, u, lw, color):
     """Speedometer: open dial with a needle — the dashboard gauge."""
     d.arc([4 * u, 4 * u, 20 * u, 20 * u], start=135, end=405, fill=color, width=lw)
@@ -74,27 +65,6 @@ def _security(d, u, lw, color):
     pts = [(12 * u, 3 * u), (19.5 * u, 6 * u), (18.5 * u, 13 * u),
            (12 * u, 21 * u), (5.5 * u, 13 * u), (4.5 * u, 6 * u)]
     d.line(pts + [pts[0]], fill=color, width=lw, joint="curve")
-
-
-def _speed(d, u, lw, color):
-    """Lightning bolt (speed / performance), filled."""
-    pts = [(13.5 * u, 2 * u), (5.5 * u, 13.5 * u), (10.5 * u, 13.5 * u),
-           (9.5 * u, 22 * u), (18.5 * u, 9.5 * u), (13 * u, 9.5 * u)]
-    d.polygon(pts, fill=color)
-
-
-def _settings(d, u, lw, color):
-    """Gear: toothed ring with a hub hole."""
-    d.ellipse([5.5 * u, 5.5 * u, 18.5 * u, 18.5 * u], outline=color, width=lw)
-    for k in range(8):
-        ang = math.pi / 4 * k
-        x1 = 12 + 6.5 * math.cos(ang)
-        y1 = 12 + 6.5 * math.sin(ang)
-        x2 = 12 + 9.5 * math.cos(ang)
-        y2 = 12 + 9.5 * math.sin(ang)
-        d.line([x1 * u, y1 * u, x2 * u, y2 * u], fill=color, width=lw)
-    r = 2.2 * u
-    d.ellipse([12 * u - r, 12 * u - r, 12 * u + r, 12 * u + r], outline=color, width=lw)
 
 
 def _processes(d, u, lw, color):
@@ -192,14 +162,6 @@ def _network(d, u, lw, color):
     d.ellipse([12 * u - r, 18 * u - r, 12 * u + r, 18 * u + r], fill=color)
 
 
-def _health(d, u, lw, color):
-    """Heart (system health)."""
-    pts = [(12 * u, 20.5 * u), (4.5 * u, 13 * u), (4.5 * u, 8 * u),
-           (8.2 * u, 4.5 * u), (12 * u, 7.5 * u), (15.8 * u, 4.5 * u),
-           (19.5 * u, 8 * u), (19.5 * u, 13 * u)]
-    d.polygon(pts, fill=color)
-
-
 def _refresh(d, u, lw, color):
     """Sync arrows (refresh / reload)."""
     d.arc([4.5 * u, 4.5 * u, 19.5 * u, 19.5 * u], start=30, end=270,
@@ -209,11 +171,8 @@ def _refresh(d, u, lw, color):
 
 
 _PAINTERS = {
-    "monitor": _monitor,
     "dashboard": _dashboard,
     "security": _security,
-    "speed": _speed,
-    "settings": _settings,
     "processes": _processes,
     "connections": _connections,
     "startup": _startup,
@@ -225,7 +184,6 @@ _PAINTERS = {
     "gpu": _gpu,
     "disk": _disk,
     "network": _network,
-    "health": _health,
     "refresh": _refresh,
 }
 

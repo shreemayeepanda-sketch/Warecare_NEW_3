@@ -137,7 +137,6 @@ def render_html(payload: dict) -> str:
     ts = str(payload.get("timestamp", ""))
     host = str(payload.get("hostname", ""))
     summary = payload.get("summary", {}) or {}
-    hw = payload.get("hardware", {}) or {}
 
     cards: list[tuple[str, str]] = [
         ("Host", host),
