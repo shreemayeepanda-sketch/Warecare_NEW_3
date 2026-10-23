@@ -54,10 +54,13 @@ class TestLogDirSelection(unittest.TestCase):
             self.assertIn(lc.APP_NAME, str(log_dir))
 
     def test_macos_uses_application_support(self):
+        # Assert the pure path selection, not get_log_dir(): the latter
+        # verifies writability and would fall back to the temp directory on
+        # Windows, where the faked "/Users/test" path is not creatable.
         with patch.object(Path, "home", return_value=Path("/Users/test")), \
              patch.object(lc.sys, "platform", "darwin"):
-            log_dir = lc.get_log_dir()
-            self.assertIn("Application Support", str(log_dir))
+            root = lc._user_data_root()
+            self.assertIn("Application Support", str(root))
 
     def test_unwritable_primary_falls_back_to_temp(self):
         # Primary path cannot be created; temp dir is the documented fallback.
