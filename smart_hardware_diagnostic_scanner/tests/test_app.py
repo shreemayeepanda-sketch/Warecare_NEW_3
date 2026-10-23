@@ -367,9 +367,20 @@ class TestDashboardLayout(unittest.TestCase):
         self.app.update()
         row_w = self.app.cards_row.winfo_width()
         widths = self._card_widths()
-        context = (f"geometry={self.app.winfo_geometry()} requested={geometry} "
-                   f"viewable={self.app.winfo_viewable()} state={self.app.state()} "
-                   f"row={row_w} widths={widths}")
+        page = self.app.pages.get(getattr(self.app, "current_page", ""))
+        context = (
+            f"geometry={self.app.winfo_geometry()} requested={geometry} "
+            f"viewable={self.app.winfo_viewable()} state={self.app.state()} "
+            f"root={self.app.winfo_width()} screen={self.app.winfo_screenwidth()} "
+            f"scale(win/widget)={self.app._get_window_scaling()}/"
+            f"{self.app._get_widget_scaling()} "
+            f"sidebar={self.app.sidebar.winfo_width()} "
+            f"main={self.app.pages_frame.master.winfo_width()} "
+            f"pages={self.app.pages_frame.winfo_width()} "
+            f"page={page.winfo_width() if page is not None else 'n/a'} "
+            f"row={row_w} widths={widths} "
+            f"requested_card_widths="
+            f"{[int(c.cget('width')) for c, _ in self.app._card_slots]}")
         self.assertEqual(len(widths), 5, context)
         pad = 8 * 4  # 5 cards, padx=(0, 8) each
         total = sum(widths) + pad
