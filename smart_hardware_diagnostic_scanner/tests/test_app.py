@@ -8,6 +8,7 @@ from __future__ import annotations
 import customtkinter as ctk
 import queue
 import threading
+import time
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -322,24 +323,62 @@ class TestDashboardLayout(unittest.TestCase):
     def _card_widths(self):
         return [card.winfo_width() for card, _ in self.app._card_slots]
 
+    def _settle_geometry(self, geometry: str, timeout_s: float = 2.0) -> None:
+        """Wait (bounded) for the OS to apply a resize to the mapped window.
+
+        ``geometry()`` only queues the request. On Windows the new size is
+        delivered by the window manager asynchronously, so two immediate
+        ``update()`` calls can return while the card row is still laid out
+        at its requested content width.
+        """
+        requested_w = int(geometry.split("x")[0])
+        # Tk clamps to the app's minsize (960x620); CTk scales both.
+        expected_w = self.app._apply_window_scaling(max(960, requested_w))
+        deadline = None
+        last = None
+        stable = 0
+        for _ in range(200):  # hard cap, ~4 s of pumping
+            self.app.update_idletasks()
+            self.app.update()
+            if deadline is None:
+                # The first pump maps the window and can itself take seconds
+                # (icons render, the WM applies the initial size); don't let
+                # that consume the settle budget.
+                deadline = time.monotonic() + timeout_s
+            state = (self.app.winfo_width(), self.app.cards_row.winfo_width())
+            if state == last:
+                stable += 1
+                # Require both a settled row and an applied window width.
+                if stable >= 5 and self.app.winfo_width() >= expected_w - 2:
+                    return
+            else:
+                stable = 0
+                last = state
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.02)
+
     def _assert_cards_fit(self, geometry: str):
         self.app.geometry(geometry)
-        self.app.update_idletasks()
-        self.app.update()
+        self._settle_geometry(geometry)
         # Force a relayout pass with the final geometry.
         self.app.event_generate("<Configure>", when="tail")
         self.app.update_idletasks()
         self.app.update()
         row_w = self.app.cards_row.winfo_width()
         widths = self._card_widths()
-        self.assertEqual(len(widths), 5)
+        context = (f"geometry={self.app.winfo_geometry()} requested={geometry} "
+                   f"viewable={self.app.winfo_viewable()} state={self.app.state()} "
+                   f"row={row_w} widths={widths}")
+        self.assertEqual(len(widths), 5, context)
         pad = 8 * 4  # 5 cards, padx=(0, 8) each
         total = sum(widths) + pad
         self.assertLessEqual(total, row_w + 2,
-                             f"cards overflow: total {total} > row {row_w}")
+                             f"cards overflow: total {total} > row {row_w} ({context})")
         for w in widths:
             # Cards may shrink with the window but must stay usable.
-            self.assertGreaterEqual(w, 60, "card collapsed below usable width")
+            self.assertGreaterEqual(w, 60,
+                                    f"card collapsed below usable width ({context})")
 
     def test_cards_fit_default_geometry(self):
         self._assert_cards_fit("1180x760")
