@@ -2752,7 +2752,10 @@ def largest_files(root: "str | os.PathLike[str]", limit: int = 25,
         nonlocal files_seen, dirs_skipped, partial
         if depth > max_depth:
             return
-        if time.monotonic() > deadline:
+        # ">=" (not ">"): a zero budget is spent the moment it is granted, and
+        # Windows' coarse monotonic clock can return the same tick as the
+        # deadline calculation, which made a zero-budget scan walk the tree.
+        if time.monotonic() >= deadline:
             partial = True
             return
         try:

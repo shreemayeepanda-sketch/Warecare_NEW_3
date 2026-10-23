@@ -343,10 +343,14 @@ class TestDiskIo(unittest.TestCase):
         first = types.SimpleNamespace(read_bytes=1_000, write_bytes=2_000)
         second = types.SimpleNamespace(read_bytes=1_000 + 5_120_000,
                                        write_bytes=2_000 + 1_024_000)
-        with patch.object(g.psutil, "disk_io_counters", return_value=first):
-            g.collect_disk_io()
-        with patch.object(g.psutil, "disk_io_counters", return_value=second):
-            snap = g.collect_disk_io()
+        # Deterministic clock: two back-to-back samples can land on the same
+        # Windows monotonic tick, which honestly yields "no rate yet" and
+        # would make this test flaky rather than wrong.
+        with patch.object(g.time, "monotonic", side_effect=[1000.0, 1001.0]):
+            with patch.object(g.psutil, "disk_io_counters", return_value=first):
+                g.collect_disk_io()
+            with patch.object(g.psutil, "disk_io_counters", return_value=second):
+                snap = g.collect_disk_io()
         self.assertIsNotNone(snap.read_bps)
         self.assertGreater(snap.read_bps, 0)
         self.assertGreater(snap.write_bps, 0)

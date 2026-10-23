@@ -110,7 +110,11 @@ class TestHardwareCollection(unittest.TestCase):
         fake.net_if_addrs.return_value = {"Ethernet": [], "Wi-Fi": []}
         fake.net_io_counters.return_value = MagicMock(bytes_sent=1000, bytes_recv=2000)
         hw._prev_net.update({"sent": 0, "recv": 0, "t": 0.0})
-        with patch.object(hw, "HAS_PSUTIL", True), patch.object(hw, "psutil", fake):
+        # Deterministic clock: two back-to-back samples can land on the same
+        # Windows monotonic tick, which honestly yields "no rate yet" and
+        # would make this test flaky rather than wrong.
+        with patch.object(hw, "HAS_PSUTIL", True), patch.object(hw, "psutil", fake), \
+             patch.object(hw.time, "monotonic", side_effect=[100.0, 101.0, 102.0]):
             first = hw.collect_network()
             self.assertIsNone(first.up_bps)  # first sample has no rate
             self.assertIsNone(first.down_bps)
