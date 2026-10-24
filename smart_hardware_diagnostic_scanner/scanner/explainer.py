@@ -308,6 +308,271 @@ def _from_patterns(text: str, system: str) -> Explanation | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Crash explainers. Records come from scanner.crashlog (Windows event log)
+# and from the crashes/crash_*.json files the background snapshotter writes;
+# the optional ``snapshot`` argument is one such file's pre-crash hardware
+# sample ({"cpu", "ram_percent", "gpu_temp", "captured_at"}).
+# ---------------------------------------------------------------------------
+#: Plain-English lines for the Windows exception codes that turn up in
+#: application-crash records (event 1000). Keys are normalised through
+#: `_normalise_exception_code`: upper-case, 0x-prefixed hex. Every value is a
+#: standalone sentence so it can follow any lead-in. Codes outside this map
+#: fall through to the generic explanation instead of being guessed at.
+EXCEPTION_CODE_TEXT: dict[str, str] = {
+    "0xC0000005": (
+        "The process crashed because it tried to read or write memory it "
+        "was not allowed to touch (access violation). This is the most "
+        "common crash code and does not, by itself, prove faulty RAM."),
+    "0x80000003": (
+        "The process hit a low-level breakpoint (STATUS_BREAKPOINT). This "
+        "is usually a program or its protection layer stopping itself, "
+        "not a hardware fault."),
+    "0xC0000094": (
+        "The process divided an integer by zero — a plain programming bug "
+        "in the application or one of its components."),
+    "0xC0000096": (
+        "The process attempted a privileged CPU instruction it was not "
+        "allowed to execute."),
+    "0xC00000FD": (
+        "The process ran out of stack space (stack overflow), usually from "
+        "endless recursion inside the program."),
+    "0xC0000409": (
+        "The process detected that a stack guard value had been overrun "
+        "(stack buffer overrun / fail-fast) and stopped itself rather than "
+        "continue with a corrupted stack."),
+    "0xC0000135": (
+        "The application could not start because a DLL (dynamic-link "
+        "library) it needs is missing."),
+    "0xC0000142": (
+        "The application could not start because one of its DLLs failed to "
+        "initialise — often after a half-applied update or a broken runtime "
+        "installation."),
+    "0xC0000006": (
+        "The process could not read back data it had paged out to disk "
+        "(in-page error); failing sectors or a disturbed drive fit this "
+        "pattern."),
+    "0xC000027B": (
+        "The app failed with a packaged (WinRT) 'stowed exception', which "
+        "is how Microsoft Store apps surface an unhandled error."),
+    "0xE0434352": (
+        "The process died from an unhandled .NET runtime exception."),
+    "0xE06D7363": (
+        "The process died from an unhandled Microsoft Visual C++ "
+        "exception."),
+}
+
+#: Core Windows modules: an access violation inside one of these is the
+#: documented trigger for suggesting a System File Checker run. Deliberately
+#: short and well-known names only — nothing is inferred about other files.
+_WINDOWS_SYSTEM_MODULES = frozenset({
+    "ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll",
+    "gdi32.dll", "advapi32.dll", "combase.dll", "ole32.dll", "oleaut32.dll",
+    "shell32.dll", "msvcrt.dll", "shlwapi.dll", "ws2_32.dll", "win32u.dll",
+    "uxtheme.dll", "ntoskrnl.exe",
+})
+
+_SHUTDOWN_EVENT_TEXT = (
+    "Windows shut down unexpectedly (power loss or forced power-off).")
+
+
+def known_exception_codes() -> frozenset[str]:
+    """Exception codes with a dedicated line (parity with `known_codes`)."""
+    return frozenset(EXCEPTION_CODE_TEXT)
+
+
+def known_windows_system_modules() -> frozenset[str]:
+    """Core Windows modules the SFC advice recognises (docs and tests)."""
+    return frozenset(_WINDOWS_SYSTEM_MODULES)
+
+
+def _normalise_exception_code(value) -> str:
+    """Return '0x'-prefixed upper-case hex for an exception code, or "".
+
+    Accepts ints (0xC0000005 == 3221225477) and string spellings: hex with or
+    without the 0x prefix ("0xc0000005", "C0000005") and plain decimal
+    ("3221225477"). Digits-only strings read as decimal unless a 0x prefix
+    says otherwise, because a hex code with no a–f digit is indistinguishable
+    from an ordinary number. Unparseable values stay unknown — the explainer
+    never guesses.
+    """
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return f"0x{value & 0xFFFFFFFF:08X}"
+    raw = str(value).strip().lower()
+    if not raw:
+        return ""
+    prefixed = raw.startswith("0x")
+    text = raw[2:] if prefixed else raw.replace(" ", "").replace("_", "")
+    if not text:
+        return ""
+    try:
+        # Hex only when spelled out (0x prefix) or when a–f digits appear;
+        # otherwise digits-only text is read as decimal (NTSTATUS codes also
+        # surface as decimal strings in the event log).
+        if prefixed or any(ch in text for ch in "abcdef"):
+            parsed = int(text, 16)
+        elif text.isdigit():
+            parsed = int(text, 10)
+        else:
+            return ""
+    except ValueError:
+        return ""
+    return f"0x{parsed & 0xFFFFFFFF:08X}"
+
+
+def _crash_event_id(crash: dict) -> int | None:
+    """Event id as int, or None when the record does not carry one."""
+    try:
+        return int(crash.get("event_id"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _crash_app_name(crash: dict) -> str:
+    """App name with an honest fallback (never a guessed program)."""
+    return str(crash.get("app") or "").strip() or "The application"
+
+
+def _snapshot_ram_percent(snapshot: dict | None) -> float | None:
+    """Recorded RAM percent from a pre-crash snapshot dict, or None."""
+    if not isinstance(snapshot, dict):
+        return None
+    for key in ("ram_percent", "ram", "mem_percent"):
+        value = snapshot.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _crash_lead(app: str, event_id: int | None) -> tuple[str, str]:
+    """Title and opening sentence for one stopped-application record."""
+    if event_id == 1002:
+        return (f"Hang: {app}",
+                f"{app} stopped responding (Windows event 1002) and was "
+                "closed or had to be restarted.")
+    if event_id == 1001:
+        return (f"Crash report: {app}",
+                f"Windows Error Reporting recorded a crash report for "
+                f"{app} (event 1001).")
+    title = f"Crash: {app}"
+    if event_id is not None:
+        return title, f"{app} stopped working unexpectedly (event {event_id})."
+    return title, f"{app} stopped working unexpectedly."
+
+
+def _crash_fix_text(app: str, code: str, module: str, ram: float | None,
+                    event_id: int | None) -> str:
+    """Compose generic-but-grounded 'How to fix' steps from the record.
+
+    Only fields the record actually carries are referenced; nothing about
+    the user's machine is invented, and the scanner never runs any of it.
+    """
+    steps: list[str] = []
+    if event_id == 41:
+        steps.append(
+            "Check whether power was lost or the machine was switched off "
+            "while it was running (held power button, battery change, wall "
+            "switch or outage). If it repeats with no obvious power cause, "
+            "run 'sfc /scannow' in an administrator terminal and check the "
+            "drive's SMART health.")
+    if ram is not None and ram >= 85.0:
+        steps.append(
+            f"Close memory-heavy programs before trying {app} again — the "
+            f"record shows RAM was at {ram:.0f}% in the seconds before the "
+            "crash.")
+    if event_id != 41:
+        if module:
+            steps.append(
+                f"Update or reinstall the software package that owns "
+                f"'{module}': the record names it as the faulting module, "
+                "so that package is the first thing to repair.")
+        else:
+            steps.append(
+                f"Update or reinstall {app} from its official source "
+                "before anything else.")
+    if code == "0xC0000005" and module.lower() in _WINDOWS_SYSTEM_MODULES:
+        steps.append(
+            f"An access violation inside the Windows module '{module}' is "
+            "worth checking with System File Checker: open an "
+            "'Administrator' terminal and run 'sfc /scannow'. It takes "
+            "several minutes; the scanner never runs it for you.")
+    if code in ("0xC0000135", "0xC0000142"):
+        steps.append(
+            "This start-up failure points at a missing or broken runtime "
+            "component: use the 'repair' mode of the installer that "
+            "provides the DLL named in the row before reinstalling the "
+            "whole application.")
+    steps.append(
+        "Keep free disk space on the system drive and install pending "
+        "Windows and driver updates. These are the standard first steps "
+        "for this record — nothing else was changed by the scanner.")
+    return " ".join(steps)
+
+
+def explain_crash(crash: dict | None,
+                  snapshot: dict | None = None) -> Explanation | None:
+    """Explain one crash record from the Windows event log, in plain English.
+
+    ``crash`` uses the dict shape produced by scanner.crashlog (event_id,
+    timestamp, app, faulting_module, exception_code, message, key);
+    ``snapshot`` is the optional pre-crash hardware sample saved beside it
+    in crashes/crash_*.json. Returns ``None`` for empty input — no invented
+    explanations — and performs no I/O; the result is deterministic.
+
+    Dedicated lines exist for the common exception codes (0xC0000005,
+    0x80000003, 0xC0000094, 0xC0000409, …) and for the unexpected-shutdown
+    event (41); an access violation adds the recorded RAM percent when the
+    snapshot shows 85% or more. Everything else falls back to a generic
+    explanation — pattern-matching the raw message (via `explain_finding`)
+    is skipped on purpose, because crash text often mentions subsystem
+    words ("disk", "memory") that would produce unrelated hardware advice.
+    """
+    if not crash:
+        return None
+    app = _crash_app_name(crash)
+    event_id = _crash_event_id(crash)
+    code = _normalise_exception_code(crash.get("exception_code"))
+    module = str(crash.get("faulting_module") or "").strip()
+    ram = _snapshot_ram_percent(snapshot)
+
+    if event_id == 41:  # scanner.crashlog.SHUTDOWN_EVENT_ID
+        return Explanation(
+            "Windows — unexpected shutdown",
+            _SHUTDOWN_EVENT_TEXT
+            + " Windows also logs it after a held power button or an outage "
+              "during use; if the machine was frozen first, the frozen "
+              "program is the starting point, not the power supply.",
+            _crash_fix_text(app, code, module, ram, event_id=event_id),
+            "info")
+
+    title, lead = _crash_lead(app, event_id)
+    parts = [lead]
+    if module:
+        parts.append(f"Windows recorded '{module}' as the faulting module.")
+    code_line = EXCEPTION_CODE_TEXT.get(code)
+    if code_line is not None:
+        parts.append(code_line)
+        if code == "0xC0000005" and ram is not None and ram >= 85.0:
+            parts.append(f"Your RAM was at {ram:.0f}% when this happened.")
+    elif code:
+        parts.append(
+            f"The record lists exception code {code}; no dedicated "
+            "explanation is available for it yet.")
+    else:
+        # Neither a mapped code nor a code field at all (e.g. a bare hang
+        # or WER record): honest generic text instead of a guess.
+        parts.append(
+            "This record carries no exception code, so there is no "
+            "dedicated explanation for it yet. The scanner only reads "
+            "data; it changes nothing.")
+    return Explanation(
+        title, " ".join(part.strip() for part in parts if part.strip()),
+        _crash_fix_text(app, code, module, ram, event_id=event_id),
+        "info")
+
+
 def explain_finding(finding, system: str | None = None) -> Explanation | None:
     """Explain a FAIL/WARNING finding; return None for anything else.
 

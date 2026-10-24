@@ -1,6 +1,7 @@
 """Dark Neon desktop GUI (CustomTkinter). All widget updates run on the main thread."""
 from __future__ import annotations
 
+import json
 import os
 import platform
 import queue
@@ -18,11 +19,15 @@ import customtkinter as ctk
 from . import theme as T
 from . import icons
 from .charts import HAS_MPL, ChartPanel
+try:
+    from . import crashlog as _crashlog
+except ImportError:  # scanner/crashlog.py is optional; the UI degrades
+    _crashlog = None
 from . import ctk_widgets as ctkw
 from .actions import ACTION_LABELS, METRIC_LABELS, ActionRule, RuleEngine
 from .diagnostics import (DEFAULT_THRESHOLDS, DiagnosticReport, compare_reports,
                           run_diagnostics, system_health_score)
-from .explainer import explain_finding
+from .explainer import Explanation, explain_crash, explain_finding
 from .filesutil import largest_files
 from .gpu import GpuStatus
 from .hardware import HAS_PSUTIL, HardwareSnapshot, collect_processes, collect_snapshot
@@ -40,8 +45,15 @@ from .utils import format_bytes, safe_path_for_report
 
 log = configure_logging()
 
+# "Crash Log" is a new page and icons.py's NAV_ICONS predates it; register
+# its sidebar icon mapping here (runtime only — icons.py is not modified).
+# A crash history reads as a document, so it reuses the existing "reports"
+# painter. This keeps NAV_ICONS and NAV_ITEMS in lockstep, which show_page
+# and the icon-coverage invariant both rely on.
+icons.NAV_ICONS.setdefault("Crash Log", "reports")
+
 NAV_ITEMS = ["Dashboard", "Processes", "Connections", "Startup", "Automation",
-             "Diagnostics", "Reports & Tools"]
+             "Diagnostics", "Reports & Tools", "Crash Log"]
 
 #: Display size (px) of the sidebar's vector icons.
 ICON_SIZE = 20
@@ -87,6 +99,213 @@ def preview_temp_candidates(limit: int = 200) -> tuple[list[Path], str]:
     return out, f"Scanned {root} (top level only, safe suffixes)."
 
 
+# ---------------------------------------------------------------------------
+# Crash log (Crash Log page). Data helpers are module-level and pure: they
+# read the Windows event log through scanner.crashlog and the
+# crashes/crash_*.json records written next to pre-crash snapshots. All of
+# them degrade to empty results plus honest notes instead of raising.
+# ---------------------------------------------------------------------------
+CRASH_ROW_LIMIT = 5        # application-crash rows shown (newest first)
+SHUTDOWN_ROW_LIMIT = 3     # unexpected-shutdown rows merged with those
+CRASH_ROWS_CAP = 50        # defensive bound after merging saved files
+
+#: The spec'd degrade row, shown when the event log cannot be read at all.
+#: The status note (the page's muted line) still carries the precise reason.
+CRASH_UNAVAILABLE_ROW = "Event log unavailable (run as administrator)"
+
+
+def _crash_dirs() -> list[Path]:
+    """Directories holding crash_*.json records, most specific first.
+
+    scanner.crashlog.default_crashes_dir() is authoritative when present;
+    the documented fallback is <repo root>/crashes next to the scanner
+    package.
+    """
+    candidates: list[Path] = []
+    if _crashlog is not None and hasattr(_crashlog, "default_crashes_dir"):
+        try:
+            candidates.append(Path(_crashlog.default_crashes_dir()))
+        except Exception:  # noqa: BLE001 - degrade, never crash the GUI
+            log.debug("default_crashes_dir() failed", exc_info=True)
+    candidates.append(Path(__file__).resolve().parents[2] / "crashes")
+    out: list[Path] = []
+    for directory in candidates:
+        if directory not in out:
+            out.append(directory)
+    return out
+
+
+def _crash_file_records() -> list[tuple[dict, dict | None]]:
+    """(crash, snapshot) pairs from saved crashes/crash_*.json files.
+
+    Reader-only, matching the background snapshotter's documented shape
+    {"saved_at", "crash", "snapshot"}. Malformed or unreadable files are
+    skipped — nothing is invented for them.
+    """
+    out: list[tuple[dict, dict | None]] = []
+    for directory in _crash_dirs():
+        try:
+            paths = sorted(directory.glob("crash_*.json"))
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            crash = data.get("crash")
+            if not isinstance(crash, dict) or not crash:
+                continue
+            snapshot = data.get("snapshot")
+            out.append((crash,
+                        snapshot if isinstance(snapshot, dict) else None))
+    return out
+
+
+def _crash_row_identity(crash: dict) -> tuple:
+    """Stable identity for de-duplicating event-log vs saved-file rows."""
+    return (str(crash.get("event_id", "")), str(crash.get("timestamp", "")),
+            str(crash.get("app", "")))
+
+
+def _crash_code_display(crash: dict) -> str:
+    """Error Code column text; '—' when the record names no code."""
+    raw = crash.get("exception_code")
+    if raw in (None, ""):
+        return "—"
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return f"0x{raw & 0xFFFFFFFF:08X}"
+    text = str(raw).strip()
+    return text.upper() if text else "—"
+
+
+def _crash_row(crash: dict, snapshot: dict | None = None,
+               shutdown: bool = False) -> dict:
+    """Uniform row dict: a crash entry (or one with a stored snapshot)."""
+    return {"status_row": "", "crash": crash, "snapshot": snapshot,
+            "shutdown": shutdown}
+
+
+def _crash_status_row(text: str) -> dict:
+    return {"status_row": text, "crash": None, "snapshot": None,
+            "shutdown": False}
+
+
+def _crash_sample_line(snapshot: dict | None) -> str:
+    """One-line summary of the pre-crash hardware snapshot, or "".
+
+    Reads exactly the documented field names ("cpu", "ram_percent",
+    "gpu_temp", "captured_at"); values the snapshot does not carry are
+    omitted, never guessed ("No data" semantics).
+    """
+    if not isinstance(snapshot, dict):
+        return ""
+    parts: list[str] = []
+    cpu = snapshot.get("cpu")
+    if isinstance(cpu, (int, float)) and not isinstance(cpu, bool):
+        parts.append(f"CPU {float(cpu):.0f}%")
+    ram = snapshot.get("ram_percent")
+    if isinstance(ram, (int, float)) and not isinstance(ram, bool):
+        parts.append(f"RAM {float(ram):.0f}%")
+    gpu = snapshot.get("gpu_temp")
+    if isinstance(gpu, (int, float)) and not isinstance(gpu, bool):
+        parts.append(f"GPU {float(gpu):.0f} °C")
+    captured = str(snapshot.get("captured_at") or "").strip()
+    if captured:
+        parts.append(f"captured {captured}")
+    return " · ".join(parts)
+
+
+def _collect_crash_rows() -> tuple[list[dict], str]:
+    """Worker-side collector: crash rows (newest first) plus a status note.
+
+    Rows are the uniform dicts of `_crash_row`; the optional final row is
+    the honest UNAVAILABLE entry for an unreadable event log — never a
+    fabricated crash. Saved crash_*.json records are merged, de-duplicated
+    against the event-log rows, and keep the pre-crash snapshot they were
+    written with. Runs off-thread: only plain data moves through the queue.
+    """
+    rows: list[dict] = []
+    status_parts: list[str] = []
+    event_unavailable = ""
+    if _crashlog is None:
+        event_unavailable = "crashlog module missing"
+    else:
+        try:
+            ok, reason = _crashlog.availability()
+        except Exception as exc:  # noqa: BLE001 - degrade, never crash GUI
+            ok, reason = False, str(exc)
+        if ok:
+            crashes: list[dict] = []
+            shutdowns: list[dict] = []
+            try:
+                crashes = list(
+                    _crashlog.collect_recent_crashes(CRASH_ROW_LIMIT))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("crash collect failed: %s", exc)
+                status_parts.append(f"Crash collection failed: {exc}")
+            try:
+                shutdowns = list(_crashlog.collect_unexpected_shutdowns(
+                    SHUTDOWN_ROW_LIMIT))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("shutdown collect failed: %s", exc)
+                status_parts.append(f"Shutdown collection failed: {exc}")
+            rows.extend(_crash_row(crash) for crash in crashes)
+            rows.extend(_crash_row(crash, shutdown=True)
+                        for crash in shutdowns)
+            status_parts.append(f"{len(crashes)} recent crash(es), "
+                                f"{len(shutdowns)} unexpected shutdown(s)")
+        else:
+            event_unavailable = str(reason or "").strip()
+
+    # Merge saved crash_*.json records not already listed (event log wins),
+    # attaching each record's stored pre-crash snapshot to its row.
+    try:
+        files = _crash_file_records()
+    except Exception as exc:  # noqa: BLE001 - degrade, never crash GUI
+        log.warning("crash file scan failed: %s", exc)
+        files = []
+    seen = {_crash_row_identity(row["crash"]) for row in rows}
+    merged = 0
+    for crash, snapshot in files:
+        identity = _crash_row_identity(crash)
+        if identity in seen:
+            for row in rows:  # upgrade a known row with its stored snapshot
+                if (row["crash"] is not None
+                        and _crash_row_identity(row["crash"]) == identity
+                        and row["snapshot"] is None
+                        and snapshot is not None):
+                    row["snapshot"] = snapshot
+            continue
+        seen.add(identity)
+        merged += 1
+        rows.append(_crash_row(crash, snapshot))
+    if files:
+        dropped = len(files) - merged
+        status_parts.append(
+            f"{merged} saved file record(s) merged"
+            + (f", {dropped} already listed" if dropped else ""))
+    if event_unavailable:
+        status_parts.insert(0, f"Event log unavailable: {event_unavailable}.")
+
+    def _ts_key(row: dict) -> tuple[bool, str, str]:
+        crash = row["crash"] or {}
+        timestamp = str(crash.get("timestamp", ""))
+        return (bool(timestamp), timestamp, str(crash.get("app", "")))
+
+    try:
+        rows.sort(key=_ts_key, reverse=True)  # newest first; undated last
+    except Exception:  # noqa: BLE001 - sorting must never break the page
+        log.debug("crash row sort failed", exc_info=True)
+    del rows[CRASH_ROWS_CAP:]  # merged saved files stay bounded
+    note = "; ".join(part for part in status_parts if part)
+    if event_unavailable:
+        rows.append(_crash_status_row(CRASH_UNAVAILABLE_ROW))
+    return rows, note or "No crash records available."
+
+
 class ScannerApp(ctk.CTk):
     """Main application window."""
 
@@ -115,6 +334,10 @@ class ScannerApp(ctk.CTk):
         self._scan_active = False
         self._refresh_active = False
         self._procs_active = False
+        self._crashes_active = False
+        self._crashlog_seen = False
+        self._crash_rows: dict[str, dict] = {}
+        self._crash_explanation: Explanation | None = None
         self._monitor_polling = False
         self._after_ids: set[str] = set()
 
@@ -244,6 +467,7 @@ class ScannerApp(ctk.CTk):
         self._build_automation(self.pages["Automation"])
         self._build_diagnostics(self.pages["Diagnostics"])
         self._build_reports(self.pages["Reports & Tools"])
+        self._build_crashlog(self.pages["Crash Log"])
 
         # Status bar
         self.status_var = tk.StringVar(value="Ready.")
@@ -547,6 +771,203 @@ class ScannerApp(ctk.CTk):
         except tk.TclError:
             pass
         self.set_status(f"Startup: {note}")
+
+    # ---------- crash log (event-log history + saved snapshot files) ----------
+    def _build_crashlog(self, page) -> None:
+        ttk.Label(page, text="Crash log (read-only — nothing is deleted or "
+                  "changed)", style="Head.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(page, text="Recent application crashes and unexpected "
+                  "shutdowns, newest first. Select a row for a plain-English "
+                  "explanation — and for the hardware snapshot taken seconds "
+                  "before the crash when the background recorder saved one.",
+                  style="Muted.TLabel", wraplength=800,
+                  justify="left").pack(anchor="w", pady=(0, 6))
+        row = ttk.Frame(page)
+        row.pack(fill="x", pady=(0, 6))
+        self.crash_note = tk.StringVar(value="Not loaded yet.")
+        ttk.Label(row, textvariable=self.crash_note,
+                  style="Muted.TLabel").pack(side="left", padx=(0, 8))
+        ctkw.make_button(row, "ghost", T.BG_MAIN, text="Refresh",
+                         command=self.refresh_crashlog).pack(side="right")
+        # Normal container nesting (the tree's MASTER is tree_box, no in_=
+        # re-pack): re-packing a page child into a later sub-frame left the
+        # Treeview mapped but never painted on Tk 9; a plain nested pack
+        # renders it normally and keeps the intended stacked layout.
+        tree_box = ttk.Frame(page)
+        tree_box.pack(fill="x", pady=(0, 6))
+        cols = ("timestamp", "app", "errcode")
+        self.crash_tree = ttk.Treeview(tree_box, columns=cols, show="headings",
+                                       height=7)
+        for c, w, label in [("timestamp", 165, "Timestamp"),
+                            ("app", 420, "App"),
+                            ("errcode", 140, "Error Code")]:
+            self.crash_tree.heading(c, text=label)
+            self.crash_tree.column(c, width=w, anchor="w")
+        self.crash_tree.tag_configure("unavailable", foreground=T.FG_MUTED)
+        vsb = ttk.Scrollbar(tree_box, orient="vertical",
+                            command=self.crash_tree.yview)
+        self.crash_tree.configure(yscrollcommand=vsb.set)
+        self.crash_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        self.crash_tree.bind("<<TreeviewSelect>>", self._on_crash_select)
+
+        # Detail: plain-English explanation for the selected crash plus the
+        # exact pre-crash hardware sample, when one was recorded beside it.
+        detail_box = tk.LabelFrame(page, text="Selected crash", bg=T.BG_PANEL,
+                                   fg=T.NEON_CYAN, font=T.FONT_SMALL,
+                                   padx=10, pady=8)
+        detail_box.pack(fill="both", expand=True, pady=(8, 0))
+        self.crash_detail = tk.Text(detail_box, height=6, bg=T.BG_OUTPUT,
+                                    fg=T.FG_PRIMARY, font=T.FONT_MONO,
+                                    wrap="word", state="disabled")
+        dsb = ttk.Scrollbar(detail_box, orient="vertical",
+                            command=self.crash_detail.yview)
+        self.crash_detail.configure(yscrollcommand=dsb.set)
+        self.crash_detail.pack(side="left", fill="both", expand=True, padx=2,
+                               pady=2)
+        dsb.pack(side="left", fill="y")
+        crow = tk.Frame(detail_box, bg=T.BG_PANEL)
+        crow.pack(fill="x")
+        self.crash_snapshot_label = tk.Label(
+            crow, text="", bg=T.BG_PANEL, fg=T.FG_MUTED, font=T.FONT_SMALL,
+            anchor="w", justify="left", wraplength=720)
+        self.crash_snapshot_label.pack(side="left", fill="x", expand=True)
+        ctkw.make_button(crow, "ghost", T.BG_PANEL, text="How to fix",
+                         width=96,
+                         command=self._show_crash_fix).pack(side="right",
+                                                            padx=(8, 0))
+        self._set_crash_detail("Select a crash row to see a plain-English "
+                               "explanation.")
+
+    def refresh_crashlog(self) -> None:
+        """Collect crash history off-thread; rows land via the bg queue."""
+        if self._crashes_active:
+            return
+        self._crashes_active = True
+        try:
+            threading.Thread(target=self._crash_job, name="shds-crashlog",
+                             daemon=True).start()
+        except (RuntimeError, OSError) as exc:
+            log.warning("crash thread failed to start: %s", exc)
+            self._crashes_active = False
+            self.set_status("Crash log unavailable: background thread could "
+                            "not start.")
+            return
+        self.set_status("Collecting crash history…")
+
+    def _crash_job(self) -> None:
+        """Worker: plain data only — no Tkinter access from here."""
+        try:
+            rows, note = _collect_crash_rows()
+        except Exception as exc:  # noqa: BLE001 - degrade, never crash GUI
+            log.warning("crash history failed: %s", exc)
+            rows, note = [], f"Crash history failed: {exc}"
+        finally:
+            self._crashes_active = False
+        self._bg_queue.put(("crashes", (rows, note)))
+
+    def _render_crashlog(self, data) -> None:
+        rows, note = data
+        try:
+            self.crash_tree.delete(*self.crash_tree.get_children())
+        except tk.TclError:
+            return
+        self._crash_rows = {}
+        self._crash_explanation = None
+        for entry in rows:
+            if entry["status_row"]:
+                # UNAVAILABLE row, never a fabricated crash — muted colour.
+                iid = self.crash_tree.insert(
+                    "", "end", values=("—", entry["status_row"], "—"),
+                    tags=("unavailable",))
+                self._crash_rows[iid] = entry
+                continue
+            crash = entry["crash"]
+            if entry["shutdown"]:
+                app = "Windows (unexpected shutdown)"
+                code = "—"
+            else:
+                app = str(crash.get("app") or "").strip() or "—"
+                code = _crash_code_display(crash)
+            ts = str(crash.get("timestamp") or "").strip() or "—"
+            iid = self.crash_tree.insert("", "end", values=(ts, app, code))
+            self._crash_rows[iid] = entry
+        self.crash_note.set(note or "No rows.")
+        self._set_crash_detail("Select a crash row to see a plain-English "
+                               "explanation.")
+        self.crash_snapshot_label.configure(text="", fg=T.FG_MUTED)
+        self.set_status(f"Crash log: {note or 'no rows'}")
+
+    def _on_crash_select(self, _event=None) -> None:
+        """Populate the explanation panel from the explainer (main thread)."""
+        try:
+            selection = self.crash_tree.selection()
+        except tk.TclError:
+            return
+        if not selection:
+            return
+        entry = self._crash_rows.get(selection[0])
+        if entry is None:
+            return
+        if entry["status_row"]:
+            self._crash_explanation = Explanation(
+                "Event log unavailable",
+                "The Windows event log could not be read, so this row marks "
+                "it unavailable instead of showing a guess. Saved "
+                "crashes/crash_*.json records are still listed.",
+                "Restart the scanner with administrator rights ('Run as "
+                "administrator') so the event log can be read, then press "
+                "Refresh. Nothing was changed in the meantime.", "info")
+            self._set_crash_detail(
+                f"{entry['status_row']}\n"
+                f"{self._crash_explanation.explanation}")
+            self.crash_snapshot_label.configure(text="", fg=T.FG_MUTED)
+            return
+        crash = entry["crash"]
+        explanation = explain_crash(crash, entry["snapshot"])
+        self._crash_explanation = explanation
+        parts: list[str] = []
+        if explanation is not None:
+            parts.append(explanation.explanation)
+        message = str(crash.get("message") or "").strip()
+        if message and (explanation is None
+                        or message not in explanation.explanation):
+            parts.append(f"Recorded at {crash.get('timestamp', 'unknown time')}:"
+                         f"\n{message}")
+        self._set_crash_detail("\n\n".join(p for p in parts if p.strip())
+                               if parts
+                               else "No explanation available for this "
+                                    "record.")
+        sample = _crash_sample_line(entry["snapshot"])
+        if sample:
+            self.crash_snapshot_label.configure(
+                text=f"Hardware at crash: {sample}", fg=T.FG_PRIMARY)
+        else:
+            self.crash_snapshot_label.configure(
+                text="No hardware snapshot stored for this crash.",
+                fg=T.FG_MUTED)
+
+    def _show_crash_fix(self) -> None:
+        """Show the composed, generic advice for the selected crash."""
+        explanation = self._crash_explanation
+        if explanation is None:
+            messagebox.showinfo("How to fix", "Select a crash row first.")
+            return
+        self._log(f"Crash fix guidance — {explanation.title}: "
+                  f"{explanation.explanation}", "INFO")
+        self._log(f"    {explanation.fix}", "INFO")
+        messagebox.showinfo(explanation.title,
+                            f"{explanation.explanation}\n\n"
+                            f"{explanation.fix}")
+
+    def _set_crash_detail(self, text: str) -> None:
+        try:
+            self.crash_detail.configure(state="normal")
+            self.crash_detail.delete("1.0", "end")
+            self.crash_detail.insert("end", text)
+            self.crash_detail.configure(state="disabled")
+        except tk.TclError:
+            pass
 
     # ---------- automation (Auto-Action Rules / Kill Switch) ----------
     def _build_automation(self, page) -> None:
@@ -980,6 +1401,12 @@ class ScannerApp(ctk.CTk):
         self.pages[name].lift()
         self.current_page = name
         self.page_title.configure(text=name)
+        # Crash Log populates once when it first opens; afterwards only its
+        # Refresh button re-collects (the other tabs behave the same — no
+        # event-log work just for switching pages).
+        if name == "Crash Log" and not self._crashlog_seen:
+            self._crashlog_seen = True
+            self.refresh_crashlog()
         # CustomTkinter buttons have no ttk "pressed" state: the active nav
         # item is highlighted by its colours and icon instead (solid
         # background + neon-cyan icon and label).
@@ -1101,6 +1528,12 @@ class ScannerApp(ctk.CTk):
         try:
             for tag, colour in T.STATUS_COLOURS.items():
                 self.diag_text.tag_configure(tag, foreground=colour)
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            # The Crash Log's UNAVAILABLE status row also follows the palette.
+            self.crash_tree.tag_configure("unavailable",
+                                          foreground=T.FG_MUTED)
         except (tk.TclError, AttributeError):
             pass
 
@@ -1247,6 +1680,8 @@ class ScannerApp(ctk.CTk):
                         self._render_connections(data)
                     elif kind == "startup":
                         self._render_startup(data)
+                    elif kind == "crashes":
+                        self._render_crashlog(data)
                     elif kind == "smart":
                         self._render_smart(data)
                     elif kind == "bigfiles":

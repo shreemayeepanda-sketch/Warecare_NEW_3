@@ -32,3 +32,4 @@ desktop.ini
 # Local runtime data
 *.log
 *.tmp
+crashes/
