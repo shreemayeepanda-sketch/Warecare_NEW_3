@@ -3679,7 +3679,10 @@ class ScannerApp(tk.Tk):
         self.uptime_var = tk.StringVar(value="Uptime: —")
         self.battery_var = tk.StringVar(value="Battery: —")
         bar = tk.Frame(self, bg=BG_STATUSBAR, height=28)
-        bar.pack(side="bottom", fill="x")
+        # Pack the bottom strip before the expanding main column: pack grants
+        # parcels in order, so a later "side=bottom" slave otherwise takes its
+        # requested width out of the left-hand region, starving the cards.
+        bar.pack(side="bottom", fill="x", before=main_col)
         tk.Label(bar, textvariable=self.status_var, bg=BG_STATUSBAR,
                  fg=FG_MUTED, font=FONT_SMALL).pack(side="left", padx=12)
         for var, colour in ((self.scan_var, NEON_PURPLE),

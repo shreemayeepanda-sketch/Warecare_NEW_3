@@ -5233,7 +5233,10 @@ class ScannerApp(ctk.CTk):
         self.status_var = tk.StringVar(value="Ready.")
         self.scan_var = tk.StringVar(value="Last scan: never")
         bar = tk.Frame(self, bg=T.BG_STATUSBAR, height=28)
-        bar.pack(side="bottom", fill="x")
+        # Pack the bottom strip before the expanding main column: pack grants
+        # parcels in order, so a later "side=bottom" slave otherwise takes its
+        # requested width out of the left-hand region, starving the cards.
+        bar.pack(side="bottom", fill="x", before=main_col)
         tk.Label(bar, textvariable=self.status_var, bg=T.BG_STATUSBAR,
                  fg=T.FG_MUTED, font=T.FONT_SMALL).pack(side="left", padx=12)
         tk.Label(bar, textvariable=self.scan_var, bg=T.BG_STATUSBAR,
