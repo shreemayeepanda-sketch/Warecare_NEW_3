@@ -76,6 +76,36 @@ except Exception as _crashlog_exc:  # missing package, syntax version bump…
 
 log_crash = logging.getLogger("shds.crash")
 
+# Predictive Health engine: SQLite metrics history (CPU/RAM/disk samples
+# every ~60 s) powering the disk-full forecast. Same defensive pattern as
+# the crashlog shim above -- the standalone GUI keeps working without the
+# shared package and degrades to no recording (debug, never printed).
+try:
+    if str(_PARENT / "smart_hardware_diagnostic_scanner") not in sys.path:
+        sys.path.insert(0, str(_PARENT / "smart_hardware_diagnostic_scanner"))
+    from scanner import metrics_db as _metrics
+    METRICS_AVAILABLE = True
+except Exception as _metrics_exc:  # missing package, syntax version bump...
+    logging.getLogger("shds.metrics").debug("metrics_db unavailable: %s",
+                                            _metrics_exc)
+    _metrics = None  # type: ignore
+    METRICS_AVAILABLE = False
+
+log_metrics = logging.getLogger("shds.metrics")
+
+# Disk-full forecasting (Predictive Health card): fits a line through the
+# recorded disk history and estimates when each volume hits 100%. Same
+# defensive pattern as the shims above -- the standalone GUI keeps working
+# without it and degrades to the card's "prediction module missing" copy
+# (debug, never printed).
+try:
+    from scanner import predictive as _predictive
+    PREDICTIVE_AVAILABLE = True
+except Exception as _predictive_exc:  # missing package, syntax version bump...
+    log_metrics.debug("predictive unavailable: %s", _predictive_exc)
+    _predictive = None  # type: ignore
+    PREDICTIVE_AVAILABLE = False
+
 
 class _ModuleNamespace:
     """Attribute proxy over this module's globals for merged submodules."""
@@ -617,7 +647,323 @@ def pct(used: float, total: float) -> float | None:
         return None
 
 
-def is_windows() -> bool:
+# ---------------------------------------------------------------------------
+# Predictive Health card ("Trends"): pure formatting for the forecast.
+#
+# scanner.predictive fits a line through the recorded disk history (the
+# Prediction.status strings are documented on the dataclass -- the copy
+# below branches on exactly those). These helpers are pure functions on
+# plain data: no Tk, no metrics.db, no threads -- tests import them
+# directly and the off-thread collector reuses them.
+# ---------------------------------------------------------------------------
+
+#: A horizon at or below this many (rounded) days quotes the "full in N
+#: days" copy; a later horizon is only worth the filling rate. Urgency is
+#: the smaller window inside it.
+TREND_SOON_DAYS = 45
+#: A horizon this close renders in the warning colour. At every line's
+#: honesty level it is still a deadline now, not "later this year".
+TREND_URGENT_DAYS = 7
+#: Palette key painting the urgent line. NEON_YELLOW is the theme's
+#: WARNING colour (T.STATUS_COLOURS["WARNING"]) and is unique in both
+#: palettes, so the live dark/light swap maps every existing line's fg
+#: correctly before the card re-renders.
+TREND_WARN_KEY = "NEON_YELLOW"
+#: Card body line cap. Recorded mounts are free to number in the dozens on
+#: exotic machines; clipping silently would lie about the state of disks
+#: the card stops showing, so the tail collapses into an explicit line.
+TREND_MAX_LINES = 6
+#: Short lines under the card title: what the first real forecast still
+#: needs, and where recording starts. ASCII only.
+TREND_HINT_FIRST_FORECAST = "first forecast in ~6 h of data"
+TREND_HINT_MONITORING = "Starts with monitoring."
+#: Degrade copy: the collector got nothing readable this pass. (Predictions
+#: deliberately say "collecting data..." per drive; this line is for when
+#: even the per-drive split is unknown.)
+TREND_DEGRADE_TEXT = "Collecting metrics..."
+
+#: Month abbreviations for the "(by Nov 7)" eta suffix, fixed on purpose:
+#: strftime("%b") follows the current locale and a German "By Nov 7" would
+#: surprise nobody kindly.
+_TREND_MONTH_ABBRS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
+                      "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _trend_days(minutes, minutes_per_day: float = 1440.0) -> int | None:
+    """Round a minute horizon into whole days; None when unusable.
+
+    Everything but a finite, real number degrades to None instead of
+    raising: a garbage field renders no line rather than killing the card.
+    """
+    if isinstance(minutes, bool) or not isinstance(minutes, (int, float)):
+        return None
+    try:
+        value = float(minutes)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return int(round(value / minutes_per_day))
+
+
+def _trend_disk_label(mount) -> str:
+    """One card line's subject: mount "C:" becomes "Disk C".
+
+    Trailing slashes are stripped so Windows mountpoints match the copy;
+    a POSIX root ``/`` keeps its single slash. An empty mount collapses to
+    ``Disk ?`` -- honest placeholder, not a crash.
+    """
+    label = str(mount or "").strip()
+    if not label:
+        label = "?"
+    while len(label) > 1 and label[-1] in ("/", "\\", ":"):
+        label = label[:-1]
+    return "Disk " + label
+
+
+def _trend_eta_text(eta, days: int) -> str:
+    """``(by Nov 7)`` for a day-granularity eta, or an empty string.
+
+    A day horizon gets a date; a "~ hours" horizon does not -- a minute
+    of lead time against a weekday boundary is precision nobody can act
+    on. Odd eta objects degrade to no date instead of raising.
+    """
+    if eta is None or days < 1:
+        return ""
+    try:
+        month = _TREND_MONTH_ABBRS[int(eta.month) - 1]
+        day = int(eta.day)
+    except (IndexError, TypeError, ValueError, AttributeError):
+        return ""
+    return f"(by {month} {day})"
+
+
+def _trend_rate_text(rate) -> str:
+    """Filling-rate suffix such as ``1.2%/day``; empty when unusable.
+
+    Rates below 0.05%/day read as "0.0%/day" after rounding, which says
+    nothing: those are rendered by the caller as very slow growth.
+    """
+    try:
+        value = float(rate)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(value) or value <= 0.0:
+        return ""
+    return f"{value:.1f}%/day"
+
+
+def trend_line(pred) -> str:
+    """Turn one Prediction into the card's single short line.
+
+    Status copy (horizons are rounded, thresholds inclusive; the pinned
+    cases live in tests/test_predictive_glue.py):
+
+    * ``ok``, at/under TREND_SOON_DAYS -> ``Disk C: full in 14 days``
+      (below 1440 minutes it switches to hours: ``full in 24 hrs``) and,
+      when the engine produced an eta, `` (by Nov 7)`` is appended;
+    * ``ok`` further out -> ``Disk C: growing 1.2%/day`` (and very slow
+      growth when the rate vanished or rounds to 0.0);
+    * ``no_trend`` -> ``stable``; ``shrinking`` -> ``freeing space``;
+      ``unreliable`` -> ``trend unclear``; ``far_future`` -> ``very slow
+      growth`` (the kept minutes are real but not useful to quote);
+      ``insufficient_data`` -> ``collecting data...``.
+
+    Never raises: a damaged prediction renders ``Disk ?: trend unclear``.
+    """
+    try:
+        label = _trend_disk_label(getattr(pred, "mount", None))
+        status = str(getattr(pred, "status", "") or "")
+        if status == "ok":
+            minutes = getattr(pred, "minutes_to_full", None)
+            days = _trend_days(minutes)
+            if days is None:
+                return label + ": trend unclear"
+            if days <= TREND_SOON_DAYS:
+                minutes_f = float(minutes)
+                if minutes_f < 1440.0:
+                    hours = max(1, int(round(minutes_f / 60.0)))
+                    tail = "full in " + str(hours) + (" hr" if hours == 1
+                                                      else " hrs")
+                else:
+                    tail = "full in " + str(days) + (" day" if days == 1
+                                                     else " days")
+                when = _trend_eta_text(getattr(pred, "eta", None), days)
+                if when:
+                    tail += " " + when
+                return label + ": " + tail
+            rate_text = _trend_rate_text(getattr(pred, "rate_pct_per_day",
+                                                 None))
+            rate_value = getattr(pred, "rate_pct_per_day", None)
+            if (rate_text and isinstance(rate_value, (int, float))
+                    and not isinstance(rate_value, bool)
+                    and math.isfinite(float(rate_value))
+                    and float(rate_value) >= 0.05):
+                return label + ": growing " + rate_text
+            return label + ": very slow growth"
+        if status == "no_trend":
+            return label + ": stable"
+        if status == "shrinking":
+            return label + ": freeing space"
+        if status == "unreliable":
+            return label + ": trend unclear"
+        if status == "far_future":
+            return label + ": very slow growth"
+        if status == "insufficient_data":
+            return label + ": collecting data..."
+        return label + ": trend unclear"
+    except Exception:  # noqa: BLE001 - one odd page object must not kill render
+        return "Disk ?: trend unclear"
+
+
+def trend_urgency(pred) -> str:
+    """Return TREND_WARN_KEY for a line inside the urgent window, else "".
+
+    Only an ``ok`` forecast with a usable horizon at/below
+    TREND_URGENT_DAYS is a deadline; every other status is either past
+    noise control (stable/freeing) or has no date to be urgent about.
+    Never raises; the value is a palette key, resolved at render time so
+    a live theme toggle picks up the new palette.
+    """
+    try:
+        if str(getattr(pred, "status", "")) != "ok":
+            return ""
+        days = _trend_days(getattr(pred, "minutes_to_full", None))
+        if days is not None and days <= TREND_URGENT_DAYS:
+            return TREND_WARN_KEY
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def _trend_order(pred) -> tuple[int, float]:
+    """Sort key, worst first: soonest full date, then a status order.
+
+    ok/far_future (the statuses that kept minutes) sort first by those
+    minutes; no_trend/shrinking/unreliable follow in stable original
+    order; still-collecting mounts go last.
+    """
+    status = str(getattr(pred, "status", "") or "insufficient_data")
+    minutes = getattr(pred, "minutes_to_full", None)
+    if (status in ("ok", "far_future") and isinstance(minutes, (int, float))
+            and not isinstance(minutes, bool) and math.isfinite(minutes)):
+        return (0, float(minutes))
+    if status == "insufficient_data":
+        return (2, 0.0)
+    return (1, 0.0)
+
+
+def _trend_pairs(pred_list) -> list[tuple[str, str]]:
+    """Ordered (text, warn key) pairs with an explicit overflow line."""
+    ordered = sorted(pred_list, key=_trend_order)
+    pairs = [(trend_line(p), trend_urgency(p)) for p in ordered[:TREND_MAX_LINES]]
+    if len(ordered) > TREND_MAX_LINES:
+        pairs.append((f"... and {len(ordered) - TREND_MAX_LINES} more drives",
+                      ""))
+    return pairs
+
+
+def trends_lines(predictions, recorder_running: bool = False,
+                 mounts_recorded: bool | None = True
+                 ) -> tuple[list[tuple[str, str]], str]:
+    """Build the Trends card content: (per-drive pairs, one hint line).
+
+    Pure plain-data mapping (no Tk, no db, never raises). ``recorder_running``
+    is the MetricsRecorder state. ``mounts_recorded`` is what the mount
+    listing answered: True when history exists, False when it is
+    confirmed EMPTY (nobody ever recorded), None when the listing itself
+    failed and the state is unknown. Empty-state contract:
+
+    * predictions is None (the collect failed) or empty, with a
+      confirmed-empty history and a quiet recorder -> the safe
+      "Collecting metrics..." line plus the monitoring hint: an empty
+      metrics.db is the "monitoring never ran" state;
+    * same predictions with the recorder running or the history
+      unknown/present -> the same line, no hint (a tick may already be
+      writing, and assuming otherwise would contradict the state);
+    * every drive insufficient_data -> per-drive collecting copy plus the
+      first-forecast hint (12 samples over 6 h per forecast_disk_full);
+    * otherwise -> per-drive lines, worst first, capped by
+      TREND_MAX_LINES with an explicit "... and N more drives" tail.
+    """
+    try:
+        pred_list = [] if predictions is None else list(predictions)
+    except TypeError:
+        pred_list = []  # non-iterable junk: treat as "nothing computed"
+    if not pred_list:
+        if mounts_recorded is False and not recorder_running:
+            return [(TREND_DEGRADE_TEXT, "")], TREND_HINT_MONITORING
+        return [(TREND_DEGRADE_TEXT, "")], ""
+    try:
+        all_insufficient = all(
+            str(getattr(p, "status", "insufficient_data")) == "insufficient_data"
+            for p in pred_list)
+    except Exception:  # noqa: BLE001 - degrade, not crash
+        all_insufficient = False
+    hint = TREND_HINT_FIRST_FORECAST if all_insufficient else ""
+    return _trend_pairs(pred_list), hint
+
+
+def trends_summary(predictions, recorder_running: bool = False,
+                   mounts_recorded: bool | None = True
+                   ) -> tuple[list[str], str]:
+    """Text-only view of trends_lines: (lines, hint), same order and cap.
+
+    Convenience wrapper for callers (and tests) that want the copy
+    without the per-line colour keys.
+    """
+    pairs, hint = trends_lines(predictions, recorder_running, mounts_recorded)
+    return [str(text) for text, _warn in pairs], hint
+
+
+def trends_unavailable_reason() -> str:
+    """Why the card cannot forecast at all, or "" when both shims landed.
+
+    Checked once per collect, before any db call: a missing module copy
+    is exact prose the card shows instead of pretend data.
+    """
+    if not METRICS_AVAILABLE or _metrics is None:
+        return "Trends unavailable - metrics module missing"
+    if not PREDICTIVE_AVAILABLE or _predictive is None:
+        return "Trends unavailable - prediction module missing"
+    return ""
+
+
+def trends_payload(recorder_running: bool = False
+                   ) -> tuple[list[tuple[str, str]], str]:
+    """Collect the Trends card content off the Tk thread. Never raises.
+
+    Runs on a short-lived daemon thread: reads the SHARED per-user
+    metrics.db (history must survive the recorder), forecasts every
+    recorded mount, and hands back renderable pairs plus the hint. Every
+    db/forecast call is wrapped -- a failure logs via log_metrics.debug
+    and degrades to the plain collecting line, never blocking or crashing.
+    """
+    try:
+        reason = trends_unavailable_reason()
+        if reason:
+            return [(reason, "")], ""
+        db_path = _metrics.default_db_path()
+        try:
+            mounts: list[str] | None = _metrics.disk_mounts(db_path)
+        except Exception as exc:  # noqa: BLE001
+            log_metrics.debug("trends: disk_mounts failed: %s", exc)
+            mounts = None
+        try:
+            predictions = _predictive.predict_all(db_path)
+        except Exception as exc:  # noqa: BLE001
+            log_metrics.debug("trends: predict_all failed: %s", exc)
+            predictions = None
+        # Tri-state: False = confirmed empty history (nobody ever recorded,
+        # the honest "monitoring never ran" state), True = drives exist,
+        # None = the listing itself failed (state unknown, no hint).
+        mounts_recorded: bool | None = None if mounts is None else bool(mounts)
+        return trends_lines(predictions,
+                            recorder_running=bool(recorder_running),
+                            mounts_recorded=mounts_recorded)
+    except Exception as exc:  # noqa: BLE001 - degrade, never crash GUI
+        log_metrics.debug("trends collect failed: %s", exc)
+        return [(TREND_DEGRADE_TEXT, "")], ""
     return platform.system().lower() == "windows"
 
 
@@ -5337,6 +5683,238 @@ class CrashWatcher:
         log_crash.info("saved pre-crash snapshot %s", target)
 
 
+# Predictive Health engine cadences: ~60 s sampling ticks and ~6 h retention
+# pruning against the default 720 h (30 day) history window.
+METRICS_INTERVAL_S_DEFAULT = 60.0
+METRICS_PRUNE_EVERY_S = 6 * 3600.0
+METRICS_KEEP_HOURS = 720.0
+
+# Trends card refresh cadences: one refresh shortly after the window builds
+# (the db usually already holds history), one ~70 s after monitoring starts
+# (the recorder's first 60 s tick has landed by then), and a ~10 min
+# heartbeat while the app runs. The Dashboard page-show hook may trigger it
+# too, but no more often than TRENDS_SHOW_GAP_S -- page flipping must not
+# poke the metrics db on every click.
+TRENDS_INITIAL_MS = 2000
+TRENDS_FIRST_SAMPLE_MS = 70000
+TRENDS_REFRESH_MS = 600000
+TRENDS_SHOW_GAP_S = 900.0
+
+
+class MetricsRecorder:
+    """Sample CPU/RAM/disk usage into metrics.db on a background thread.
+
+    Daemon thread ticking every ``interval`` seconds (default 60): one tick
+    reads CPU percent (psutil.cpu_percent(interval=None) -- primed once
+    before the loop so the first bogus 0.0 reading is never recorded), RAM
+    percent (psutil.virtual_memory().percent) and per-mount usage through
+    the same psutil attribute path ``collect_disks()`` uses, then writes one
+    atomic sample via ``scanner.metrics_db.record_sample``. A ``prune()``
+    pass runs once when the loop starts and then every
+    METRICS_PRUNE_EVERY_S (~6 h), keeping the default METRICS_KEEP_HOURS
+    (30 days) of history.
+
+    Every record call is wrapped: a sampler or database failure logs debug
+    and the thread keeps ticking -- a broken metrics history must never be
+    the reason the app misbehaves. start()/stop() are idempotent like
+    CrashWatcher's (a running recorder is never started twice; stop joins
+    on a helper thread so the GUI never blocks). Nothing starts when
+    METRICS_AVAILABLE is False, psutil is missing (and no sampler is
+    injected) or the per-user metrics.db directory is not writable: one
+    debug line explains why, and that is the whole observable behavior.
+    ``interval`` and ``sampler`` are injectable for tests; ``db_path`` too,
+    so tests never touch the real user data directory. The loop also dies
+    naturally with the process (daemon thread) even if stop() is never
+    reached; `--scan` headless runs never construct this class, so
+    scheduled scans record nothing.
+
+    Patched (2026-10-24, Predictive Health agent): added this class beside
+    CrashWatcher, the defensive import shim after the crashlog shim
+    (_metrics / METRICS_AVAILABLE / log_metrics) and the single start()
+    call next to CrashWatcher.start() in ScannerApp.toggle_monitoring.
+    """
+
+    def __init__(self, db_path: Path | None = None,
+                 interval: float = METRICS_INTERVAL_S_DEFAULT,
+                 sampler=None, keep_hours: float = METRICS_KEEP_HOURS) -> None:
+        self.db_path = Path(db_path) if db_path is not None else None
+        self.interval = float(interval) if interval and interval > 0 else \
+            METRICS_INTERVAL_S_DEFAULT
+        self.sampler = sampler  # None = default psutil sampling path
+        self.keep_hours = float(keep_hours)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self.running = False
+
+    def start(self) -> bool:
+        """Start recording. False when already running or unusable."""
+        with self._lock:
+            if self.running:
+                return False
+            if not METRICS_AVAILABLE or _metrics is None:
+                log_metrics.debug(
+                    "MetricsRecorder not started: metrics_db unavailable")
+                return False
+            if self.sampler is None and not HAS_PSUTIL:
+                log_metrics.debug(
+                    "MetricsRecorder not started: psutil is missing")
+                return False
+            ok, reason = self._is_available()
+            if not ok:
+                log_metrics.debug("MetricsRecorder not started: %s", reason)
+                return False
+            thread = threading.Thread(target=self._loop,
+                                      name="MetricsRecorder", daemon=True)
+            try:
+                thread.start()
+            except (RuntimeError, OSError) as exc:  # mirrors MonitorWorker.start
+                log_metrics.warning("metrics recorder thread could not "
+                                    "start: %s", exc)
+                return False
+            self._thread = thread
+            self.running = True
+            return True
+
+    def stop(self) -> None:
+        """Ask the recorder to exit; joined on a helper like the monitor."""
+        with self._lock:
+            if not self.running:
+                return
+            self._stop.set()
+            thread = self._thread
+            self.running = False
+            self._thread = None
+        if thread is not None and thread.is_alive():
+            threading.Thread(target=thread.join, args=(2.0,),
+                             name="shds-metrics-reap", daemon=True).start()
+
+    def _loop(self) -> None:
+        """Sample-and-store until stopped; failure never kills the thread."""
+        try:
+            if self.sampler is None:
+                self._prime_psutil()
+            self._prune()
+            next_prune = time.monotonic() + METRICS_PRUNE_EVERY_S
+            stop = self._stop
+            while not stop.wait(self.interval):
+                try:
+                    if time.monotonic() >= next_prune:
+                        next_prune = time.monotonic() + METRICS_PRUNE_EVERY_S
+                        self._prune()
+                    self.tick()
+                except Exception as exc:  # one bad tick is never fatal
+                    log_metrics.debug("metrics tick failed: %s", exc)
+        except Exception as exc:  # framework-level fault; stop cleanly
+            log_metrics.warning("metrics recorder stopped: %s", exc)
+
+    def tick(self) -> bool:
+        """One sample-and-store pass. True when the sample hit the disk."""
+        try:
+            cpu_pct, ram_pct, disks = self.sampler() if self.sampler is not None \
+                else self._psutil_sample()
+        except Exception as exc:
+            log_metrics.debug("metrics sampler failed: %s", exc)
+            return False
+        db_path = self._db_path()
+        store = getattr(_metrics, "record_sample", None) if _metrics else None
+        if db_path is None or not callable(store):
+            log_metrics.debug("metrics record skipped: no usable backend")
+            return False
+        try:
+            stored = store(db_path, time.time(), cpu_pct, ram_pct, disks)
+        except Exception as exc:  # never kill the thread on a db hiccup
+            log_metrics.debug("metrics record failed: %s", exc)
+            return False
+        return bool(stored)
+
+    @staticmethod
+    def _psutil_sample() -> tuple:
+        """Default sampler: the collect_disks() attribute path via psutil.
+
+        Returns (cpu_pct, ram_pct, [(mount, used_pct, used_bytes,
+        total_bytes), ...]); an unreadable mount is skipped, never fatal.
+        """
+        cpu_pct = float(psutil.cpu_percent(interval=None))
+        ram_pct = float(psutil.virtual_memory().percent)
+        disks: list[tuple[str, float, int, int]] = []
+        seen: set[str] = set()
+        for part in psutil.disk_partitions(all=False):
+            key = (part.mountpoint or part.device).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+            except (OSError, PermissionError, FileNotFoundError) as exc:
+                log_metrics.debug("disk sample for %s skipped: %s",
+                                  part.mountpoint, exc)
+                continue
+            used, total = int(usage.used), int(usage.total)
+            pct = float(usage.percent)
+            # Mirror collect_disks()' clamp: windows can hand back numbers
+            # for FAT/exFAT volumes that do not add up.
+            if not (0.0 <= pct <= 100.0) and total > 0:
+                pct = round(used / total * 100.0, 1)
+            percent = min(max(pct, 0.0), 100.0)
+            disks.append((str(part.mountpoint or part.device),
+                          percent, used, total))
+        return cpu_pct, ram_pct, disks
+
+    def _prime_psutil(self) -> None:
+        """Call cpu_percent(interval=None) once: its very first return is a
+        primed 0.0, discarded here so recording starts on real data."""
+        try:
+            if HAS_PSUTIL and psutil is not None:
+                psutil.cpu_percent(interval=None)
+        except Exception as exc:
+            log_metrics.debug("psutil cpu prime failed: %s", exc)
+
+    def _db_path(self) -> Path | None:
+        """Injected path, else scanner.metrics_db.default_db_path() (None if
+        the backend cannot resolve one -- the tick simply skips)."""
+        if self.db_path is not None:
+            return self.db_path
+        fn = getattr(_metrics, "default_db_path", None) if _metrics else None
+        if not callable(fn):
+            return None
+        try:
+            return Path(fn())
+        except Exception as exc:
+            log_metrics.debug("metrics db path unresolved: %s", exc)
+            return None
+
+    def _prune(self) -> None:
+        """Drop rows older than ``keep_hours``; logs, never raises."""
+        db_path = self._db_path()
+        fn = getattr(_metrics, "prune", None) if _metrics else None
+        if db_path is None or not callable(fn):
+            return
+        try:
+            deleted = int(fn(db_path, keep_hours=self.keep_hours) or 0)
+        except Exception as exc:
+            log_metrics.debug("metrics prune failed: %s", exc)
+            return
+        if deleted:
+            log_metrics.debug("metrics pruned %d stale row(s)", deleted)
+
+    @staticmethod
+    def _is_available() -> tuple[bool, str]:
+        """Consult metrics_db.availability() defensively (an older shared
+        module without it is assumed writable; record_sample self-guards)."""
+        fn = getattr(_metrics, "availability", None) if _metrics else None
+        if not callable(fn):
+            return True, ""
+        try:
+            result = fn()
+        except Exception as exc:
+            return False, f"availability check failed: {exc}"
+        try:
+            return bool(result[0]), str(result[1]) if len(result) > 1 else ""
+        except (TypeError, IndexError):
+            return True, ""  # malformed value: let record_sample decide
+
+
 """Dark Neon desktop GUI (CustomTkinter). All widget updates run on the main thread."""
 
 
@@ -5680,6 +6258,10 @@ class ScannerApp(ctk.CTk):
         # Forensic Crash Analyzer: daemon thread writing pre-crash snapshots;
         # started when monitoring starts, stopped on shutdown (on_closing).
         self.crash_watcher = CrashWatcher(self.monitor)
+        # Predictive Health: daemon thread appending CPU/RAM/disk history to
+        # the per-user metrics.db (~every 60 s); started when monitoring
+        # starts. A quiet no-op when the shared package or psutil is missing.
+        self.metrics_recorder = MetricsRecorder()
         self.latest_snap: HardwareSnapshot | None = None
         self.latest_diag: DiagnosticReport | None = None
         self.previous_diag: DiagnosticReport | None = None
@@ -5723,6 +6305,10 @@ class ScannerApp(ctk.CTk):
                 "are unavailable.\nInstall with: pip install psutil")
         self._reschedule(250, self._poll_bg_queue)
         self._reschedule(300, self.refresh_once)
+        # Predictive Health: one early Trends refresh (the db usually already
+        # holds history from previous sessions) plus the ~10 min heartbeat.
+        self._reschedule(TRENDS_INITIAL_MS, self.refresh_trends)
+        self._reschedule(TRENDS_REFRESH_MS, self._trends_auto_loop)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     # ---------- styling / layout ----------
@@ -5964,6 +6550,38 @@ class ScannerApp(ctk.CTk):
         self.cards_row.rowconfigure(0, weight=0)
         self.cards_row.bind("<Configure>", self._on_cards_resize)
         self._last_card_width = 0
+
+        # Trends ("Predictive Health"): one line per recorded drive with the
+        # fitted disk-full verdict, worst first. Content arrives off-thread
+        # (refresh_trends -> bg queue -> _render_trends); until then, and
+        # until ~6 h of samples exist, the card says exactly that instead
+        # of inventing a forecast.
+        trends = T.make_card(page, T.BG_MAIN)
+        trends.pack(fill="x", pady=(0, 8))
+        trends.columnconfigure(0, weight=1)
+        self.trends_card = trends
+        trends_top = tk.Frame(trends, bg=T.BG_CARD)
+        trends_top.pack(fill="x", padx=12, pady=(10, 0))
+        self.trends_icon_label = ctk.CTkLabel(
+            trends_top, image=icons.get_icon("monitor", 22, T.NEON_PURPLE),
+            text="", bg_color=T.BG_CARD, width=26)
+        self.trends_icon_label.pack(side="left")
+        tk.Label(trends_top, text="Trends", bg=T.BG_CARD, fg=T.NEON_PURPLE,
+                 font=T.FONT_HEADING).pack(side="left", padx=(8, 0))
+        self.trends_hint = tk.Label(trends_top, text="", bg=T.BG_CARD,
+                                    fg=T.FG_MUTED, font=T.FONT_SMALL,
+                                    anchor="e", justify="right")
+        self.trends_hint.pack(side="right")
+        self.trends_lines = tk.Frame(trends, bg=T.BG_CARD)
+        self.trends_lines.pack(fill="x", padx=12, pady=(4, 10))
+        # The theme toggle re-renders colour-bearing icons from the fresh
+        # palette; registering here fits the card into that exact flow.
+        self._card_icons["Trends"] = (self.trends_icon_label, "monitor",
+                                      "NEON_PURPLE")
+        self._trends_last: tuple | None = None
+        self._trends_active = False
+        self._trends_refreshed_at = time.monotonic()
+        self._render_trends(([("Collecting metrics...", "")], ""))
 
         btn_row = ttk.Frame(page)
         btn_row.pack(fill="x", pady=(0, 8))
@@ -6275,6 +6893,88 @@ class ScannerApp(ctk.CTk):
         except (tk.TclError, AttributeError):
             pass
         self.set_status(f"Crash log: {note or 'no rows'}")
+
+    # ---------- Predictive Health: Trends card ----------
+    def refresh_trends(self) -> None:
+        """Collect the Trends card off-thread; pairs land via the bg queue.
+
+        Mirrors refresh_crashlog: a short-lived named daemon thread whose
+        only Tk-adjacent act is queueing the payload. Re-triggered on a
+        page show, after monitoring starts, on a ~10 min heartbeat and
+        once shortly after the window builds; overlap is skipped, not
+        queued, so a slow collector never piles up threads.
+        """
+        if self._trends_active:
+            return
+        self._trends_active = True
+        self._trends_refreshed_at = time.monotonic()
+        try:
+            threading.Thread(target=self._trends_job, name="shds-trends",
+                             daemon=True).start()
+        except (RuntimeError, OSError) as exc:
+            log_metrics.debug("trends thread failed to start: %s", exc)
+            self._trends_active = False
+
+    def _trends_job(self) -> None:
+        """Worker: pure data only -- no Tkinter access from here."""
+        try:
+            pairs, hint = trends_payload(
+                recorder_running=bool(getattr(
+                    getattr(self, "metrics_recorder", None), "running",
+                    False)))
+        except Exception as exc:  # noqa: BLE001 - degrade, never crash GUI
+            log_metrics.debug("trends collect failed: %s", exc)
+            pairs, hint = [(TREND_DEGRADE_TEXT, "")], ""
+        finally:
+            self._trends_active = False
+        self._bg_queue.put(("trends", (pairs, hint)))
+
+    def _render_trends(self, data) -> None:
+        """Main thread: rebuild the card's line labels from the queued payload.
+
+        The body is never a snapshot left half-drawn: the old labels are
+        destroyed first, then every pair becomes one plain label -- the
+        warn key is resolved at render time from the active palette, so a
+        live theme toggle re-running this method recolors honestly.
+        """
+        try:
+            pairs, hint = data
+            frame = self.trends_lines
+            hint_label = self.trends_hint
+            for child in frame.winfo_children():
+                child.destroy()
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            return
+        self._trends_last = (pairs, hint)
+        for text, warn in pairs:
+            # getattr keeps a garbage warn key from killing the render
+            # loop mid-way (half a card is worse than a muted card).
+            fg = getattr(T, str(warn), T.FG_PRIMARY) if warn else T.FG_PRIMARY
+            tk.Label(frame, text=str(text), bg=T.BG_CARD, fg=fg,
+                     font=T.FONT_MONO, anchor="w", justify="left").pack(
+                         fill="x", anchor="w")
+        try:
+            hint_label.configure(text=str(hint or ""))
+        except tk.TclError:
+            pass
+
+    def _trends_auto_loop(self) -> None:
+        """~10 min heartbeat: re-collect the card while the app runs.
+
+        Same reschedule-own-loop idiom as _poll_bg_queue/_poll_monitor,
+        so shutdown cancels it through the shared _after_ids set.
+        """
+        self.refresh_trends()
+        self._reschedule(TRENDS_REFRESH_MS, self._trends_auto_loop)
+
+    def _trends_on_show(self) -> None:
+        """Dashboard page-show hook, throttled by TRENDS_SHOW_GAP_S."""
+        try:
+            elapsed = time.monotonic() - self._trends_refreshed_at
+        except (AttributeError, TypeError):
+            return
+        if elapsed >= TRENDS_SHOW_GAP_S:
+            self.refresh_trends()
 
     def _on_crash_select(self, _event=None) -> None:
         """Populate the explanation panel from the explainer (main thread)."""
@@ -6806,6 +7506,12 @@ class ScannerApp(ctk.CTk):
         if name == "Crash Log" and not self._crashlog_seen:
             self._crashlog_seen = True
             self.refresh_crashlog()
+        # Predictive Health: the Trends card refreshes when the user lands
+        # back on the Dashboard, throttled by TRENDS_SHOW_GAP_S -- the
+        # collector touches the metrics db, so page flipping stays free of
+        # database work under that gap.
+        if name == "Dashboard":
+            self._trends_on_show()
         # CustomTkinter buttons have no ttk "pressed" state: the active nav
         # item is highlighted by its colours and icon instead (solid
         # background + neon-cyan icon and label).
@@ -6858,6 +7564,14 @@ class ScannerApp(ctk.CTk):
         # Vector icons carry colours baked into their bitmaps: redraw them
         # from the freshly swapped palette.
         self._refresh_card_icons()
+        # Trends card: a re-render from the cached payload (no metrics
+        # recompute) resolves the warn key and title accent against the
+        # new palette, exactly like the snapshot re-render above.
+        try:
+            if self._trends_last is not None:
+                self._render_trends(self._trends_last)
+        except (AttributeError, TypeError, ValueError) as exc:
+            log_app.debug("trends re-render after theme change failed: %s", exc)
         self.theme_btn.configure(
             text="◐  Switch to dark" if mode == "light" else "◐  Switch to light")
         self.set_status(f"Theme: {mode}.")
@@ -7104,6 +7818,8 @@ class ScannerApp(ctk.CTk):
                         self._render_startup(data)
                     elif kind == "crashes":
                         self._render_crashlog(data)
+                    elif kind == "trends":
+                        self._render_trends(data)
                     elif kind == "smart":
                         self._render_smart(data)
                     elif kind == "bigfiles":
@@ -7663,6 +8379,20 @@ class ScannerApp(ctk.CTk):
                 self.crash_watcher.start()
             except Exception as exc:
                 log_crash.debug("crash watcher start failed: %s", exc)
+            # Predictive Health: run the metrics recorder alongside the
+            # monitoring loop (idempotent; a quiet no-op when the shared
+            # package is missing, psutil is unavailable or the per-user
+            # metrics.db directory is not writable — never breaks the
+            # monitoring start itself).
+            try:
+                self.metrics_recorder.start()
+            except Exception as exc:
+                log_metrics.debug("metrics recorder start failed: %s", exc)
+            # Predictive Health: the recorder needs a tick or two before the
+            # card can say anything new (interval is 60 s), so exactly one
+            # refresh ~70 s in turns "Collecting metrics..." into real copy;
+            # before that the card keeps its honest not-enough-data state.
+            self._reschedule(TRENDS_FIRST_SAMPLE_MS, self.refresh_trends)
             if not self._monitor_polling:
                 self._monitor_polling = True
                 self._reschedule(500, self._poll_monitor)
