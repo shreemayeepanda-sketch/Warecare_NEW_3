@@ -17,6 +17,11 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+    env:
+      # Unbuffered output preserves the last test name if a runner dies.
+      PYTHONUNBUFFERED: "1"
+      # Headless-safe matplotlib backend; tests never show plots.
+      MPLBACKEND: "Agg"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,7 +36,8 @@ jobs:
       - name: Install optional runtime deps
         run: python -m pip install psutil matplotlib plyer
       - name: Run test suite
-        run: python -m unittest discover -s tests -v
+        timeout-minutes: 10
+        run: python -X faulthandler -u -m unittest discover -s tests -v
 
   exe:
     name: PyInstaller build (Windows)
